@@ -1,0 +1,47 @@
+[package]
+name = "solana-thunder"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+resolver = "3"
+members = [
+    "crates/core",
+    "crates/raydium-amm-v4",
+    "crates/raydium-clmm",
+    "crates/meteora-damm",
+    "crates/meteora-dlmm",
+    "crates/pumpfun-amm",
+]
+
+[dependencies]
+thunder-core = { path = "crates/core" }
+raydium-amm-v4 = { path = "crates/raydium-amm-v4" }
+raydium-clmm = { path = "crates/raydium-clmm" }
+meteora-damm = { path = "crates/meteora-damm" }
+meteora-dlmm = { path = "crates/meteora-dlmm" }
+pumpfun-amm = { path = "crates/pumpfun-amm" }
+
+[dev-dependencies]
+tokio = { version = "1.43.0", features = ["rt-multi-thread", "macros", "time"] }
+futures = "0.3.31"
+dotenvy = "0.15"
+
+# Geyser streaming
+yellowstone-grpc-client = "11.0"
+yellowstone-grpc-proto = { version = "11.0", features = ["plugin"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+
+solana-pubkey = { workspace = true }
+
+[workspace.dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+
+solana-sdk = "3.0"
+solana-pubkey = "3.0"
+solana-system-interface = { version = "3.0", features = ["bincode"] }
+
+spl-associated-token-account = "8.0"
+spl-token = { version = "9.0", features = ["no-entrypoint"] }
+
+borsh = "1.6"
