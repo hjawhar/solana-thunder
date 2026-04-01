@@ -101,7 +101,7 @@ solana-thunder/
 |       +-- loader.rs                   # Async RPC pool loading for all 6 DEXs
 |       +-- router.rs                   # Multi-hop route finding (BFS, 1-3 hops)
 |       +-- transaction.rs              # Versioned transaction builder (v0)
-|       +-- price.rs                    # Token price oracle (SOL/USD via pools + API)
+|       +-- price.rs                    # Token price oracle (SOL/USD on-chain via CLMM sqrt_price)
 |       +-- stats.rs                    # Pool and system resource statistics
 |       +-- cli.rs                      # Progress bars + interactive REPL
 +-- tests/
@@ -133,9 +133,9 @@ RPC_URL="https://your-rpc-endpoint.com" ./target/release/thunder-agg
 ```
 
 The aggregator will:
-1. Load all pools from all 6 DEXs via `getProgramAccounts` (with progress bars)
-2. Build an in-memory token-pair graph (~2M pools, ~1.7M tokens)
-3. Fetch SOL/USD price from CoinGecko API
+1. Fetch SOL/USD price on-chain from the highest-liquidity Raydium CLMM SOL/USDC pool's `sqrt_price_x64`
+2. Load all pools from all 6 DEXs via `getProgramAccounts` (with progress bars)
+3. Build an in-memory token-pair graph (~2M pools, ~1.7M tokens)
 4. Enter an interactive REPL
 
 ### REPL Commands
@@ -264,7 +264,7 @@ impl Market for SomeDexMarket {
 |`crates/aggregator/src/loader.rs`|Async RPC pool loading for all 6 DEXs (discriminator + memcmp filters)|
 |`crates/aggregator/src/router.rs`|Multi-hop route finding (BFS, hub-first, liquidity filtering)|
 |`crates/aggregator/src/transaction.rs`|Versioned transaction builder (v0, multi-hop composition)|
-|`crates/aggregator/src/price.rs`|Token pricing via pool graph + CoinGecko API fallback|
+|`crates/aggregator/src/price.rs`|Token pricing: SOL/USD on-chain via CLMM `sqrt_price_x64`, per-token via pool graph|
 |`crates/aggregator/src/cli.rs`|Progress bars (indicatif) + interactive REPL (rustyline)|
 |`tests/trade_stream.rs`|Live DEX swap streaming via Yellowstone gRPC|
 |`tests/creation_stream.rs`|Live token + pool creation streaming via Yellowstone gRPC|
@@ -276,7 +276,7 @@ impl Market for SomeDexMarket {
 - **No `rustfmt.toml`, `clippy.toml`, or `.cargo/config.toml`** -- default rules
 - **All dependency versions** centralized in root `[workspace.dependencies]`
 - **7 workspace dependencies total:** `serde`, `solana-sdk`, `solana-pubkey`, `solana-system-interface`, `spl-associated-token-account`, `spl-token`, `borsh`
-- **Aggregator dependencies:** `tokio`, `futures`, `solana-rpc-client`, `solana-rpc-client-api`, `solana-account-decoder-client-types`, `solana-commitment-config`, `indicatif`, `rustyline`, `sysinfo`, `reqwest`, `serde_json`
+- **Aggregator dependencies:** `tokio`, `futures`, `solana-rpc-client`, `solana-rpc-client-api`, `solana-account-decoder-client-types`, `solana-commitment-config`, `indicatif`, `rustyline`, `sysinfo`
 - **Dev dependencies** (tests only): `tokio`, `futures`, `dotenvy`, `yellowstone-grpc-client`, `yellowstone-grpc-proto`, `solana-rpc-client`, `solana-rpc-client-api`, `solana-commitment-config`, `solana-account-decoder-client-types`
 
 ## Testing

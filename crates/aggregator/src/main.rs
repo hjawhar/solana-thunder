@@ -1,5 +1,7 @@
 use std::env;
 
+use solana_commitment_config::CommitmentConfig;
+use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use thunder_aggregator::{cli, loader, price, stats};
 
 #[tokio::main]
@@ -12,7 +14,20 @@ async fn main() {
 
     println!("RPC: {rpc_url}\n");
 
-    // Progress bars while loading pools from all DEXes.
+    // Fetch SOL/USD from on-chain CLMM sqrt_price before loading pools.
+    let rpc = RpcClient::new_with_commitment(rpc_url.clone(), CommitmentConfig::confirmed());
+    let sol_usd_price = match price::fetch_sol_usd_onchain(&rpc).await {
+        Some(p) => {
+            println!("SOL/USD: ${p:.2} (on-chain CLMM)\n");
+            Some(p)
+        }
+        None => {
+            println!("Warning: Could not fetch SOL/USD from CLMM, will derive from pools\n");
+            None
+        }
+    };
+
+    // Load all pools with progress bars.
     let display = cli::LoadingDisplay::new();
     let progress_cb = display.progress_callback();
 
@@ -31,22 +46,14 @@ async fn main() {
         index.unique_mints()
     );
 
-    // Fetch SOL/USD price from Jupiter API (more reliable than pool-derived).
-    let sol_usd_price = match price::fetch_sol_usd_price_api().await {
-        Some(p) => {
-            println!("SOL/USD: ${p:.2} (Jupiter API)\n");
-            Some(p)
+    // Fall back to pool-derived price if CLMM fetch failed.
+    let sol_usd_price = sol_usd_price.or_else(|| {
+        let p = price::get_sol_usd_price(&index);
+        if let Some(p) = p {
+            println!("SOL/USD: ${p:.2} (pool-derived)\n");
         }
-        None => {
-            let p = price::get_sol_usd_price(&index);
-            if let Some(p) = p {
-                println!("SOL/USD: ${p:.2} (pool-derived)\n");
-            } else {
-                println!("Warning: Could not determine SOL/USD price\n");
-            }
-            p
-        }
-    };
+        p
+    });
 
     // Interactive command loop.
     let mut stats_collector = stats::StatsCollector::new();

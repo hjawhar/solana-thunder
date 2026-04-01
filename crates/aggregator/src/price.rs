@@ -1,32 +1,39 @@
-//! Token price discovery using the pool graph.
+//! Token price discovery — fully on-chain, no external APIs.
 //!
-//! Derives SOL and USD prices by finding the highest-liquidity direct pool
-//! for each pair. Falls back to Jupiter Price API for SOL/USD when no
-//! on-chain USDC/WSOL pool qualifies.
+//! SOL/USD derived from the highest-liquidity Raydium CLMM SOL/USDC pool's
+//! `sqrt_price_x64` field. Per-token prices from the loaded pool index.
 
 use solana_pubkey::Pubkey;
+use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 use thunder_core::{GenericError, USDC, WSOL};
 
 use crate::pool_index::PoolIndex;
 use crate::types::TokenPrice;
 
 /// Minimum combined vault balance for a pool to be used in pricing.
-/// Set high enough to exclude dust pools that produce unreliable prices.
 const MIN_PRICING_LIQUIDITY: u64 = 10_000_000_000; // ~10 SOL equivalent
+
+/// Raydium CLMM program.
+const RAYDIUM_CLMM_PROGRAM: &str = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK";
+
+// Byte offsets in a Raydium CLMM pool account (1544 bytes, 8-byte Anchor disc).
+const CLMM_MINT_0_OFFSET: usize = 73;
+const CLMM_MINT_1_OFFSET: usize = 105;
+const CLMM_DECIMALS_0_OFFSET: usize = 233;
+const CLMM_DECIMALS_1_OFFSET: usize = 234;
+const CLMM_LIQUIDITY_OFFSET: usize = 237;   // u128, 16 bytes
+const CLMM_SQRT_PRICE_OFFSET: usize = 253;  // u128, 16 bytes
 
 /// Get the price of a token in SOL and USD.
 ///
-/// `sol_usd_override` lets the caller inject a known SOL/USD price
-/// (e.g., from Jupiter API) so the sync function doesn't need async.
+/// `sol_usd` is the pre-fetched SOL/USD price (from on-chain CLMM oracle).
 pub fn get_token_price(
     index: &PoolIndex,
     mint: &Pubkey,
-    sol_usd_override: Option<f64>,
+    sol_usd: Option<f64>,
 ) -> Result<TokenPrice, GenericError> {
     let wsol = Pubkey::from_str_const(WSOL);
     let usdc = Pubkey::from_str_const(USDC);
-
-    let sol_usd = sol_usd_override.or_else(|| get_sol_usd_price(index));
 
     if *mint == wsol {
         return Ok(TokenPrice {
@@ -38,7 +45,6 @@ pub fn get_token_price(
 
     let price_sol = best_pool_price(index, mint, &wsol);
 
-    // Try direct USDC pool first; fall back to SOL-denominated price * SOL/USD.
     let price_usd = if let Some(direct_usd) = best_pool_price(index, mint, &usdc) {
         Some(direct_usd)
     } else if let Some(sol_price) = &price_sol {
@@ -54,7 +60,91 @@ pub fn get_token_price(
     })
 }
 
-/// SOL price in USD from the highest-liquidity USDC/WSOL pool.
+/// Fetch SOL/USD price on-chain from the highest-liquidity Raydium CLMM
+/// SOL/USDC pool's `sqrt_price_x64`.
+///
+/// Queries `getProgramAccounts` for CLMM pools with WSOL + USDC mints,
+/// picks the one with the most liquidity, and converts its sqrt_price to
+/// a human-readable USDC-per-SOL price. Single RPC call + one getAccountInfo
+/// per candidate pool.
+pub async fn fetch_sol_usd_onchain(rpc: &RpcClient) -> Option<f64> {
+    let program = Pubkey::from_str_const(RAYDIUM_CLMM_PROGRAM);
+    let wsol = Pubkey::from_str_const(WSOL);
+    let usdc = Pubkey::from_str_const(USDC);
+
+    // Discover SOL/USDC CLMM pools (WSOL at mint_0, USDC at mint_1).
+    let config = solana_rpc_client_api::config::RpcProgramAccountsConfig {
+        filters: Some(vec![
+            solana_rpc_client_api::filter::RpcFilterType::DataSize(1544),
+            solana_rpc_client_api::filter::RpcFilterType::Memcmp(
+                solana_rpc_client_api::filter::Memcmp::new_raw_bytes(
+                    CLMM_MINT_0_OFFSET,
+                    wsol.to_bytes().to_vec(),
+                ),
+            ),
+            solana_rpc_client_api::filter::RpcFilterType::Memcmp(
+                solana_rpc_client_api::filter::Memcmp::new_raw_bytes(
+                    CLMM_MINT_1_OFFSET,
+                    usdc.to_bytes().to_vec(),
+                ),
+            ),
+        ]),
+        account_config: solana_rpc_client_api::config::RpcAccountInfoConfig {
+            encoding: Some(solana_account_decoder_client_types::UiAccountEncoding::Base64),
+            commitment: Some(solana_commitment_config::CommitmentConfig::confirmed()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    #[allow(deprecated)]
+    let accounts = rpc
+        .get_program_accounts_with_config(&program, config)
+        .await
+        .ok()?;
+
+    // Pick the pool with the highest liquidity.
+    let mut best_price: Option<f64> = None;
+    let mut best_liquidity: u128 = 0;
+
+    for (_pubkey, account) in &accounts {
+        let data = &account.data;
+        if data.len() < CLMM_SQRT_PRICE_OFFSET + 16 {
+            continue;
+        }
+
+        let liquidity = u128::from_le_bytes(
+            data[CLMM_LIQUIDITY_OFFSET..CLMM_LIQUIDITY_OFFSET + 16]
+                .try_into()
+                .ok()?,
+        );
+        if liquidity <= best_liquidity {
+            continue;
+        }
+
+        let sqrt_price_x64 = u128::from_le_bytes(
+            data[CLMM_SQRT_PRICE_OFFSET..CLMM_SQRT_PRICE_OFFSET + 16]
+                .try_into()
+                .ok()?,
+        );
+        let dec0 = data[CLMM_DECIMALS_0_OFFSET]; // WSOL = 9
+        let dec1 = data[CLMM_DECIMALS_1_OFFSET]; // USDC = 6
+
+        let sqrt_price = sqrt_price_x64 as f64 / (1u128 << 64) as f64;
+        let raw_price = sqrt_price * sqrt_price; // token_1_raw per token_0_raw
+        let human_price = raw_price * 10f64.powi(dec0 as i32 - dec1 as i32);
+        // human_price = USDC per SOL
+
+        if human_price.is_finite() && human_price > 0.0 {
+            best_price = Some(human_price);
+            best_liquidity = liquidity;
+        }
+    }
+
+    best_price
+}
+
+/// SOL price in USD from the highest-liquidity USDC/WSOL pool in the index (fallback).
 pub fn get_sol_usd_price(index: &PoolIndex) -> Option<f64> {
     let wsol = Pubkey::from_str_const(WSOL);
     let usdc = Pubkey::from_str_const(USDC);
@@ -73,9 +163,6 @@ pub fn get_sol_usd_price(index: &PoolIndex) -> Option<f64> {
         let Ok(meta) = pool.market.metadata() else { continue };
         let Ok(raw_price) = pool.market.current_price() else { continue };
 
-        // current_price() returns quote_per_base.
-        // If quote=USDC, base=WSOL → price is already USD/SOL.
-        // If quote=WSOL, base=USDC → invert to get USD/SOL.
         let price = if meta.quote_mint == usdc { raw_price } else { 1.0 / raw_price };
 
         if !price.is_finite() || price <= 0.0 {
@@ -106,9 +193,6 @@ fn best_pool_price(index: &PoolIndex, mint_a: &Pubkey, mint_b: &Pubkey) -> Optio
         let Ok(meta) = pool.market.metadata() else { continue };
         let Ok(raw_price) = pool.market.current_price() else { continue };
 
-        // current_price() = quote_per_base.
-        // If base=mint_a → price is already mint_b/mint_a.
-        // If base=mint_b → invert to get mint_b/mint_a.
         let adjusted = if meta.base_mint == *mint_a { raw_price } else { 1.0 / raw_price };
 
         if !adjusted.is_finite() || adjusted <= 0.0 {
@@ -120,46 +204,4 @@ fn best_pool_price(index: &PoolIndex, mint_a: &Pubkey, mint_b: &Pubkey) -> Optio
     }
 
     best_price
-}
-
-/// Fetch SOL/USD price from CoinGecko free API.
-pub async fn fetch_sol_usd_price_api() -> Option<f64> {
-    let url = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd";
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .user_agent("thunder-aggregator/0.1.0")
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("Price API client build failed: {e}");
-            return None;
-        }
-    };
-    let resp = match client.get(url).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("Price API request failed: {e}");
-            return None;
-        }
-    };
-    let text = match resp.text().await {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("Price API read body failed: {e}");
-            return None;
-        }
-    };
-    let json: serde_json::Value = match serde_json::from_str(&text) {
-        Ok(j) => j,
-        Err(e) => {
-            eprintln!("Price API parse failed: {e}, body: {}", &text[..text.len().min(200)]);
-            return None;
-        }
-    };
-    let price = json["solana"]["usd"].as_f64();
-    if price.is_none() {
-        eprintln!("Price API: 'solana.usd' not found in response: {}", &text[..text.len().min(200)]);
-    }
-    price
 }

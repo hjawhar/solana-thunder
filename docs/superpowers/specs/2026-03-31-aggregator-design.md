@@ -99,9 +99,9 @@ After fetching pool accounts, batch-fetch vault balances via `getMultipleAccount
 
 ## Price Oracle
 
+SOL price in USD: fetched on-chain from the highest-liquidity Raydium CLMM SOL/USDC pool's `sqrt_price_x64`. Single `getProgramAccounts` call with WSOL+USDC memcmp filters, pick the pool with highest liquidity, convert sqrt_price to human-readable USDC-per-SOL.
 Token price in SOL: find best 1-hop pool pairing token with WSOL, use `current_price()`.
-SOL price in USD: find best USDC/WSOL pool, use its price. Fallback: Jupiter Price API v2.
-Token price in USD: token_price_sol * sol_price_usd.
+Token price in USD: token_price_sol * sol_price_usd. No external APIs.
 
 ## CLI Interface
 
@@ -138,13 +138,8 @@ solana-commitment-config = "3.0"
 
 # CLI
 indicatif = "0.17"
-clap = { version = "4", features = ["derive"] }
 rustyline = "15"
 
 # Stats
 sysinfo = "0.34"
-
-# Price API fallback
-reqwest = { version = "0.12", features = ["json"] }
-serde_json = "1.0"
 ```

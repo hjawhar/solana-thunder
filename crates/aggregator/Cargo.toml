@@ -38,7 +38,3 @@ rustyline = "15"
 
 # Stats
 sysinfo = "0.34"
-
-# Price API fallback + serialization
-reqwest = { version = "0.12", features = ["json"] }
-serde_json = "1.0"
