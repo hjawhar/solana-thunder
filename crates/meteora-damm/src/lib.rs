@@ -137,6 +137,10 @@ impl MeteoraDAMMMarket {
 }
 
 impl Market for MeteoraDAMMMarket {
+    fn is_active(&self) -> bool {
+        self.pool.enabled
+    }
+
     fn metadata(&self) -> Result<PoolMetadata, GenericError> {
         let fee_bps = (self.pool.fees.trade_fee_numerator as f64
             / self.pool.fees.trade_fee_denominator as f64
@@ -541,6 +545,10 @@ impl MeteoraDAMMV2Market {
 }
 
 impl Market for MeteoraDAMMV2Market {
+    fn is_active(&self) -> bool {
+        self.pool.pool_status == 1
+    }
+
     fn metadata(&self) -> Result<PoolMetadata, GenericError> {
         let trade_fee_bps = self.calculate_base_fee_bps();
         let protocol_fee_bps =

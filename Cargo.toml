@@ -14,6 +14,7 @@ members = [
     "crates/pumpfun-amm",
     "crates/aggregator",
 ]
+exclude = ["crates/router-program"]
 
 [dependencies]
 thunder-core = { path = "crates/core" }
@@ -27,6 +28,16 @@ pumpfun-amm = { path = "crates/pumpfun-amm" }
 tokio = { version = "1.43.0", features = ["rt-multi-thread", "macros", "time"] }
 futures = "0.3.31"
 dotenvy = "0.15"
+
+# Surfpool swap test
+thunder-aggregator = { path = "crates/aggregator" }
+solana-sdk = { workspace = true }
+solana-rpc-client = "3.0"
+solana-commitment-config = "3.0"
+solana-system-interface = { workspace = true }
+spl-associated-token-account = { workspace = true }
+spl-token = { workspace = true }
+bincode = "1.3"
 
 # Geyser streaming
 yellowstone-grpc-client = "11.0"

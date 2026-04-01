@@ -127,6 +127,15 @@ pub fn derive_bin_array_pda(lb_pair: Pubkey, bin_array_index: i64) -> (Pubkey, u
     )
 }
 
+/// Derive the bitmap extension PDA for a DLMM pool.
+pub fn derive_bitmap_extension_pda(lb_pair: Pubkey) -> (Pubkey, u8) {
+    let meteora_dlmm_program = Pubkey::from_str_const(METEORA_DYNAMIC_LMM);
+    Pubkey::find_program_address(
+        &[b"bitmap", lb_pair.as_ref()],
+        &meteora_dlmm_program,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Swap instruction args (Borsh-serialized on-chain)
 // ---------------------------------------------------------------------------
@@ -150,6 +159,9 @@ pub struct MeteoraDlmmMarket {
     pub token_x_decimals: u8,
     pub token_y_decimals: u8,
     pub flipped: bool,
+    /// Bitmap extension account address (if the pool needs one).
+    /// Set via `set_bitmap_extension()` after looking it up on-chain.
+    pub bitmap_extension: Option<Pubkey>,
 }
 
 impl MeteoraDlmmMarket {
@@ -165,6 +177,7 @@ impl MeteoraDlmmMarket {
             token_x_decimals,
             token_y_decimals,
             flipped,
+            bitmap_extension: None,
         }
     }
 
@@ -358,6 +371,18 @@ impl Market for MeteoraDlmmMarket {
         let (bin_array_pda, _) =
             derive_bin_array_pda(Pubkey::from_str_const(&self.pool_address), bin_array_index);
 
+        // Bitmap extension: check extra_accounts first, then self.bitmap_extension.
+        let bitmap_ext_key = format!("bitmap_ext:{}", self.pool_address);
+        let bitmap_ext_account = if let Some(addr_bytes) = context.extra_accounts.get(&bitmap_ext_key) {
+            if addr_bytes.len() == 32 {
+                Pubkey::try_from(addr_bytes.as_slice()).unwrap_or(meteora_dlmm_program)
+            } else {
+                meteora_dlmm_program
+            }
+        } else {
+            self.bitmap_extension.unwrap_or(meteora_dlmm_program)
+        };
+
         // Determine correct token programs for Token X and Token Y
         let token_x_program = if self.pool.token_x_mint == wsol {
             Pubkey::from_str_const(TOKEN_PROGRAM)
@@ -428,26 +453,25 @@ impl Market for MeteoraDlmmMarket {
                 };
 
                 let keys: Vec<AccountMeta> = vec![
-                    AccountMeta::new(Pubkey::from_str_const(&self.pool_address), false),
-                    AccountMeta::new_readonly(meteora_dlmm_program, false),
-                    AccountMeta::new(self.pool.reserve_x, false),
-                    AccountMeta::new(self.pool.reserve_y, false),
-                    AccountMeta::new(wsol_pubkey, false), // user_token_in = temp WSOL
-                    AccountMeta::new(context.destination_ata, false),
-                    AccountMeta::new_readonly(self.pool.token_x_mint, false),
-                    AccountMeta::new_readonly(self.pool.token_y_mint, false),
-                    AccountMeta::new(self.pool.oracle, false),
-                    AccountMeta::new_readonly(meteora_dlmm_program, false), // Host Fee In
-                    AccountMeta::new(context.user, true),
-                    AccountMeta::new_readonly(token_x_program, false),
-                    AccountMeta::new_readonly(token_y_program, false),
-                    AccountMeta::new_readonly(Pubkey::from_str_const(MEMO_PROGRAM_V2), false),
-                    AccountMeta::new_readonly(
-                        Pubkey::from_str_const(METEORA_EVENTS_AUTHORITY),
-                        false,
+                    AccountMeta::new(Pubkey::from_str_const(&self.pool_address), false), // 0: lb_pair
+                    AccountMeta::new_readonly(bitmap_ext_account, false),   // 1: bitmap_extension
+                    AccountMeta::new(self.pool.reserve_x, false),           // 2: reserve_x
+                    AccountMeta::new(self.pool.reserve_y, false),           // 3: reserve_y
+                    AccountMeta::new(wsol_pubkey, false),                   // 4: user_token_in
+                    AccountMeta::new(context.destination_ata, false),       // 5: user_token_out
+                    AccountMeta::new_readonly(self.pool.token_x_mint, false), // 6: token_x_mint
+                    AccountMeta::new_readonly(self.pool.token_y_mint, false), // 7: token_y_mint
+                    AccountMeta::new(self.pool.oracle, false),              // 8: oracle
+                    AccountMeta::new_readonly(meteora_dlmm_program, false), // 9: host_fee (None)
+                    AccountMeta::new(context.user, true),                   // 10: user
+                    AccountMeta::new_readonly(token_x_program, false),      // 11: token_x_program
+                    AccountMeta::new_readonly(token_y_program, false),      // 12: token_y_program
+                    AccountMeta::new_readonly(Pubkey::from_str_const(MEMO_PROGRAM_V2), false), // 13: memo_program
+                    AccountMeta::new_readonly(                              // 14: event_authority
+                        Pubkey::from_str_const(METEORA_EVENTS_AUTHORITY), false,
                     ),
-                    AccountMeta::new_readonly(meteora_dlmm_program, false), // Program
-                    AccountMeta::new(bin_array_pda, false),
+                    AccountMeta::new_readonly(meteora_dlmm_program, false), // 15: program
+                    AccountMeta::new(bin_array_pda, false),                 // remaining[0]: bin_array
                 ];
 
                 // Discriminator for DLMM swap
@@ -505,26 +529,25 @@ impl Market for MeteoraDlmmMarket {
                 };
 
                 let keys: Vec<AccountMeta> = vec![
-                    AccountMeta::new(Pubkey::from_str_const(&self.pool_address), false),
-                    AccountMeta::new_readonly(meteora_dlmm_program, false),
-                    AccountMeta::new(self.pool.reserve_x, false),
-                    AccountMeta::new(self.pool.reserve_y, false),
-                    AccountMeta::new(context.source_ata, false),
-                    AccountMeta::new(wsol_pubkey, false), // user_token_out = temp WSOL
-                    AccountMeta::new_readonly(self.pool.token_x_mint, false),
-                    AccountMeta::new_readonly(self.pool.token_y_mint, false),
-                    AccountMeta::new(self.pool.oracle, false),
-                    AccountMeta::new_readonly(meteora_dlmm_program, false), // Host Fee In
-                    AccountMeta::new(context.user, true),
-                    AccountMeta::new_readonly(token_x_program, false),
-                    AccountMeta::new_readonly(token_y_program, false),
-                    AccountMeta::new_readonly(Pubkey::from_str_const(MEMO_PROGRAM_V2), false),
-                    AccountMeta::new_readonly(
-                        Pubkey::from_str_const(METEORA_EVENTS_AUTHORITY),
-                        false,
+                    AccountMeta::new(Pubkey::from_str_const(&self.pool_address), false), // 0: lb_pair
+                    AccountMeta::new_readonly(bitmap_ext_account, false),   // 1: bitmap_extension
+                    AccountMeta::new(self.pool.reserve_x, false),           // 2: reserve_x
+                    AccountMeta::new(self.pool.reserve_y, false),           // 3: reserve_y
+                    AccountMeta::new(context.source_ata, false),            // 4: user_token_in
+                    AccountMeta::new(wsol_pubkey, false),                   // 5: user_token_out (WSOL)
+                    AccountMeta::new_readonly(self.pool.token_x_mint, false), // 6: token_x_mint
+                    AccountMeta::new_readonly(self.pool.token_y_mint, false), // 7: token_y_mint
+                    AccountMeta::new(self.pool.oracle, false),              // 8: oracle
+                    AccountMeta::new_readonly(meteora_dlmm_program, false), // 9: host_fee (None)
+                    AccountMeta::new(context.user, true),                   // 10: user
+                    AccountMeta::new_readonly(token_x_program, false),      // 11: token_x_program
+                    AccountMeta::new_readonly(token_y_program, false),      // 12: token_y_program
+                    AccountMeta::new_readonly(Pubkey::from_str_const(MEMO_PROGRAM_V2), false), // 13: memo_program
+                    AccountMeta::new_readonly(                              // 14: event_authority
+                        Pubkey::from_str_const(METEORA_EVENTS_AUTHORITY), false,
                     ),
-                    AccountMeta::new_readonly(meteora_dlmm_program, false), // Program
-                    AccountMeta::new(bin_array_pda, false),
+                    AccountMeta::new_readonly(meteora_dlmm_program, false), // 15: program
+                    AccountMeta::new(bin_array_pda, false),                 // remaining[0]: bin_array
                 ];
 
                 // Discriminator for DLMM swap

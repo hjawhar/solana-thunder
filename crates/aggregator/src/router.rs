@@ -447,6 +447,11 @@ fn simulate_hop(
     let entry = index.get_pool(pool_address)?;
     let meta = entry.market.metadata().ok()?;
 
+    // Skip inactive pools (e.g. DAMM V2 pool_status != 1).
+    if !entry.market.is_active() {
+        return None;
+    }
+
     // Skip pools with negligible liquidity.
     if let Ok(fin) = entry.market.financials() {
         if fin.quote_balance < MIN_VAULT_BALANCE && fin.base_balance < MIN_VAULT_BALANCE {

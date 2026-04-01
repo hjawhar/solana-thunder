@@ -1,0 +1,16 @@
+[package]
+name = "thunder-router"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+solana-program = "2.2"
+spl-token = { version = "9.0", features = ["no-entrypoint"] }
+spl-associated-token-account = { version = "8.0", features = ["no-entrypoint"] }
+borsh = "1.6"
+
+[features]
+no-entrypoint = []

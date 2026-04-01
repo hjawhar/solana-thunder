@@ -166,6 +166,12 @@ pub struct RequiredAccounts {
 /// Each DEX crate provides a struct implementing this trait. All methods are
 /// synchronous and pure — no I/O, no RPC calls.
 pub trait Market: Send + Sync {
+    /// Whether this pool is active and can execute swaps.
+    /// Default: true. Override for DEXs with on-chain status fields.
+    fn is_active(&self) -> bool {
+        true
+    }
+
     /// Get pool metadata (address, mints, vaults, fees).
     fn metadata(&self) -> Result<PoolMetadata, GenericError>;
 

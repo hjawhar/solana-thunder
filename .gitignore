@@ -1,4 +1,7 @@
 /target
+/crates/router-program/target
+.surfpool/
 
 .env
 *.cache
+alt_address.txt
