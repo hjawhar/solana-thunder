@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Solana Thunder is a Rust DEX aggregator library for Solana. It parses on-chain account data and builds swap instructions across 6 DEX protocols through a unified `Market` trait. The library is pure -- no RPC calls, no async, no I/O. Data fetching belongs in the caller or test suite.
+Solana Thunder is a Rust DEX aggregator for Solana. It consists of 6 pure DEX crates that parse on-chain account data and build swap instructions through a unified `Market` trait, plus an aggregator crate that loads pools from RPC, finds multi-hop routes, builds versioned transactions, and exposes an interactive CLI. The DEX crates are pure -- no RPC calls, no async, no I/O. The aggregator crate handles all I/O.
 
 ## Architecture
 
@@ -19,7 +19,10 @@ thunder-core          Market trait, shared types, constants
     +-- meteora-dlmm      Dynamic liquidity bins
     +-- pumpfun-amm       Bonding curve (virtual reserves)
 
-solana-thunder        Root crate: re-exports all of the above
+thunder-aggregator    Aggregator: pool loading, routing, pricing, CLI
+    depends on: all DEX crates + thunder-core + solana-rpc-client + tokio
+
+solana-thunder        Root crate: re-exports all DEX crates
 ```
 
 No DEX crate imports another DEX crate. Adding a new DEX means creating a new crate and adding it to the workspace -- zero changes to existing code.
@@ -52,6 +55,19 @@ The caller is responsible for:
 5. Calling `required_accounts()` to learn what extra data to fetch
 6. Populating `SwapContext` and calling `build_swap_instruction()`
 
+### Aggregator Data Flow
+
+```
+RPC getProgramAccounts --> deserialize per-DEX --> PoolIndex (token graph)
+     (disc + mint memcmp)                              |
+                                                       v
+User query (A->B, amount) --> Router (BFS, max 3 hops) --> simulate all paths
+                                                       |
+                                                  best route
+                                                       |
+                          TransactionBuilder --> VersionedTransaction (v0)
+```
+
 ## Key Directories
 
 ```
@@ -62,7 +78,7 @@ solana-thunder/
 |   +-- core/src/
 |   |   +-- lib.rs                      # Exports traits + constants
 |   |   +-- traits.rs                   # Market trait, SwapArgs, SwapContext, etc.
-|   |   +-- constants.rs                # WSOL, USDC, TOKEN_PROGRAM, etc.
+|   |   +-- constants.rs                # WSOL, USDC, USDT, quote_priority, infer_mint_decimals
 |   +-- raydium-amm-v4/src/
 |   |   +-- lib.rs                      # RaydiumAMMV4 model + RaydiumAmmV4Market
 |   +-- raydium-clmm/src/
@@ -75,11 +91,24 @@ solana-thunder/
 |   +-- meteora-dlmm/src/
 |   |   +-- lib.rs                      # MeteoraDLMMPool model + MeteoraDlmmMarket
 |   +-- pumpfun-amm/src/
-|       +-- lib.rs                      # PumpfunAmmPool model + PumpfunAmmMarket
-|       +-- pda.rs                      # 10 PDA derivation functions
+|   |   +-- lib.rs                      # PumpfunAmmPool model + PumpfunAmmMarket
+|   |   +-- pda.rs                      # 10 PDA derivation functions
+|   +-- aggregator/src/
+|       +-- lib.rs                      # Public module exports
+|       +-- main.rs                     # CLI binary entry point (thunder-agg)
+|       +-- types.rs                    # PoolEntry, Route, RouteHop, Quote, TokenPrice, etc.
+|       +-- pool_index.rs              # In-memory token-pair graph (mint adjacency list)
+|       +-- loader.rs                   # Async RPC pool loading for all 6 DEXs
+|       +-- router.rs                   # Multi-hop route finding (BFS, 1-3 hops)
+|       +-- transaction.rs              # Versioned transaction builder (v0)
+|       +-- price.rs                    # Token price oracle (SOL/USD via pools + API)
+|       +-- stats.rs                    # Pool and system resource statistics
+|       +-- cli.rs                      # Progress bars + interactive REPL
 +-- tests/
     +-- trade_stream.rs                 # Live DEX swap streaming via Yellowstone gRPC
     +-- creation_stream.rs              # Live token + pool creation streaming
+    +-- pool_financials.rs              # Live pool update streaming
+    +-- validate_prices.rs              # Price validation across DEXs
 ```
 
 ## Development Commands
@@ -90,6 +119,35 @@ cargo build                        # Build all crates
 cargo test                         # Run unit tests (5 tick array tests in raydium-clmm)
 cargo test -p raydium-clmm         # Run tests for one crate
 cargo check -p thunder-core        # Check a single crate
+cargo build --release -p thunder-aggregator  # Build aggregator binary (release)
+```
+
+### Running the Aggregator
+
+```bash
+# Run with an RPC endpoint
+RPC_URL="https://your-rpc-endpoint.com" cargo run --release -p thunder-aggregator
+
+# Or run the built binary directly
+RPC_URL="https://your-rpc-endpoint.com" ./target/release/thunder-agg
+```
+
+The aggregator will:
+1. Load all pools from all 6 DEXs via `getProgramAccounts` (with progress bars)
+2. Build an in-memory token-pair graph (~2M pools, ~1.7M tokens)
+3. Fetch SOL/USD price from CoinGecko API
+4. Enter an interactive REPL
+
+### REPL Commands
+
+```
+thunder> help                                           # Show available commands
+thunder> price SOL                                      # SOL price in USD
+thunder> price <mint_address>                           # Token price in SOL + USD
+thunder> route SOL <to_mint> 1.0                        # Find best routes for 1 SOL
+thunder> route <from_mint> <to_mint> <amount>           # Route between any tokens
+thunder> stats                                          # Pool counts, memory, uptime
+thunder> exit                                           # Exit
 ```
 
 ### Integration Tests (require Geyser endpoint)
@@ -139,16 +197,18 @@ impl Market for SomeDexMarket {
 
 ### Serialization
 
-| Layer | Crate | Usage |
-|-------|-------|-------|
-| On-chain account data | `borsh` | `BorshDeserialize` on pool model structs. 8-byte discriminator skip for Anchor programs. |
-| Instruction args | `borsh` | `BorshSerialize` with hand-crafted discriminator prefix. |
-| Cache/API | `serde` | `Serialize, Deserialize` derives on all public types. |
+|Layer|Crate|Usage|
+|---|---|---|
+|On-chain account data|`borsh`|`BorshDeserialize` on pool model structs. 8-byte discriminator skip for Anchor programs.|
+|Instruction args|`borsh`|`BorshSerialize` with hand-crafted discriminator prefix.|
+|Cache/API|`serde`|`Serialize, Deserialize` derives on all public types.|
 
 ### Constants
 
 - DEX-specific program IDs live in each DEX crate (e.g., `raydium_amm_v4::RAYDIUM_LIQUIDITY_POOL_V4`).
-- Shared constants (WSOL, USDC, TOKEN_PROGRAM) live in `thunder_core`.
+- Shared constants (WSOL, USDC, USDT, PYUSD, JITOSOL, MSOL, BSOL, JUPSOL, TOKEN_PROGRAM, TOKEN_PROGRAM_2022) live in `thunder_core`.
+- Quote currency ordering: `thunder_core::quote_priority()` returns rank (WSOL=0, USDC=1, ...).
+- Token decimal inference: `thunder_core::infer_mint_decimals()` for well-known tokens + pump.fun heuristic.
 - All constants are `pub const &str` -- convert to `Pubkey` via `Pubkey::from_str_const()`.
 
 ### Naming
@@ -159,50 +219,55 @@ impl Market for SomeDexMarket {
 
 ### Swap Instruction Discriminators
 
-| DEX | Discriminator |
-|-----|--------------|
-| Raydium V4 | `[9]` (swap_base_in) / `[11]` (swap_base_out) |
-| Raydium CLMM | `[43, 4, 237, 11, 26, 201, 30, 98]` |
-| Meteora DAMM V1/V2 | `[248, 198, 158, 145, 225, 117, 135, 200]` |
-| Meteora DLMM | `[65, 75, 63, 76, 235, 91, 91, 136]` |
-| Pumpfun AMM Buy | `[102, 6, 61, 18, 1, 218, 235, 234]` |
-| Pumpfun AMM Sell | `[51, 230, 133, 164, 1, 127, 131, 173]` |
+|DEX|Discriminator|
+|---|---|
+|Raydium V4|`[9]` (swap_base_in) / `[11]` (swap_base_out)|
+|Raydium CLMM|`[43, 4, 237, 11, 26, 201, 30, 98]`|
+|Meteora DAMM V1/V2|`[248, 198, 158, 145, 225, 117, 135, 200]`|
+|Meteora DLMM|`[65, 75, 63, 76, 235, 91, 91, 136]`|
+|Pumpfun AMM Buy|`[102, 6, 61, 18, 1, 218, 235, 234]`|
+|Pumpfun AMM Sell|`[51, 230, 133, 164, 1, 127, 131, 173]`|
 
 ### Pool Creation Discriminators
 
-| DEX | Instruction | Discriminator | Pool Idx | Mint A Idx | Mint B Idx |
-|-----|-------------|--------------|----------|------------|------------|
-| Raydium V4 | `Initialize2` | `[1]` | 4 | 8 | 9 |
-| Raydium CLMM | `create_pool` | `[233,146,209,142,207,104,64,188]` | 2 | 3 | 4 |
-| Meteora DAMM V1 | `init_permissionless_pool` | `[118,173,41,157,173,72,97,103]` | 0 | 2 | 3 |
-| Meteora DAMM V1 | `init_cp_pool_config2` | `[48,149,220,130,61,11,9,178]` | 0 | 3 | 4 |
-| Meteora DAMM V2 | `initialize_pool` | `[95,180,10,172,84,174,232,40]` | 6 | 8 | 9 |
-| Meteora DLMM | `initialize_lb_pair` | `[45,154,237,210,221,15,166,92]` | 0 | 2 | 3 |
-| Meteora DLMM | `init_cust_perm_lb_pair2` | `[243,73,129,126,51,19,241,107]` | 0 | 2 | 3 |
-| Pumpfun AMM | `create_pool` | `[233,146,209,142,207,104,64,188]` | 0 | 3 | 4 |
+|DEX|Instruction|Discriminator|Pool Idx|Mint A Idx|Mint B Idx|
+|---|---|---|---|---|---|
+|Raydium V4|`Initialize2`|`[1]`|4|8|9|
+|Raydium CLMM|`create_pool`|`[233,146,209,142,207,104,64,188]`|2|3|4|
+|Meteora DAMM V1|`init_permissionless_pool`|`[118,173,41,157,173,72,97,103]`|0|2|3|
+|Meteora DAMM V1|`init_cp_pool_config2`|`[48,149,220,130,61,11,9,178]`|0|3|4|
+|Meteora DAMM V2|`initialize_pool`|`[95,180,10,172,84,174,232,40]`|6|8|9|
+|Meteora DLMM|`initialize_lb_pair`|`[45,154,237,210,221,15,166,92]`|0|2|3|
+|Meteora DLMM|`init_cust_perm_lb_pair2`|`[243,73,129,126,51,19,241,107]`|0|2|3|
+|Pumpfun AMM|`create_pool`|`[233,146,209,142,207,104,64,188]`|0|3|4|
 
 ### Pool Discovery Memcmp Offsets
 
-| DEX | Program ID | data_size | Mint offsets | Discriminator skip |
-|-----|-----------|-----------|-------------|-------------------|
-| Raydium V4 | `675kPX...` | 752 | 400, 432 | None (byte 0) |
-| Raydium CLMM | `CAMMC...` | 1544 | 73, 105 | 8 bytes |
-| Meteora DAMM V1 | `Eo7Wj...` | 944, 952 | 40, 72 | 8 bytes |
-| Meteora DAMM V2 | `cpamd...` | 1112 | 168, 200 | 8 bytes |
-| Meteora DLMM | `LBUZKh...` | 904 | 88, 120 | 8 bytes |
-| Pumpfun AMM | `pAMMB...` | N/A | PDA derivation | 8 bytes |
+|DEX|Program ID|data_size|Mint offsets|Anchor Discriminator|
+|---|---|---|---|---|
+|Raydium V4|`675kPX...`|752|400, 432|None (no Anchor)|
+|Raydium CLMM|`CAMMC...`|1544|73, 105|`[247,237,227,245,215,195,222,70]` (PoolState)|
+|Meteora DAMM V1|`Eo7Wj...`|944|40, 72|`[241,154,109,4,17,177,109,188]` (Pool)|
+|Meteora DAMM V2|`cpamd...`|1112|168, 200|`[241,154,109,4,17,177,109,188]` (Pool)|
+|Meteora DLMM|`LBUZKh...`|904|88, 120|`[33,11,49,98,181,101,177,13]` (LbPair)|
+|Pumpfun AMM|`pAMMB...`|N/A|43, 75|`[241,154,109,4,17,177,109,188]` (Pool)|
 
 ## Important Files
 
-| File | What it is |
-|------|-----------|
-| `crates/core/src/traits.rs` | `Market` trait, `SwapArgs`, `SwapDirection`, `SwapContext`, `RequiredAccounts`, shared math |
-| `crates/core/src/constants.rs` | WSOL, USDC, TOKEN_PROGRAM addresses |
-| `crates/raydium-clmm/src/tick_arrays.rs` | CLMM tick array bitmap computation + unit tests |
-| `crates/meteora-damm/src/models.rs` | All Meteora DAMM model types (V1, V2, VaultAuthority) |
-| `crates/pumpfun-amm/src/pda.rs` | 10 PDA derivation functions for Pumpfun accounts |
-| `tests/trade_stream.rs` | Live DEX swap streaming via Yellowstone gRPC |
-| `tests/creation_stream.rs` | Live token + pool creation streaming via Yellowstone gRPC |
+|File|What it is|
+|---|---|
+|`crates/core/src/traits.rs`|`Market` trait, `SwapArgs`, `SwapDirection`, `SwapContext`, `RequiredAccounts`, shared math|
+|`crates/core/src/constants.rs`|WSOL, USDC, USDT, PYUSD, LST tokens, `quote_priority()`, `infer_mint_decimals()`|
+|`crates/raydium-clmm/src/tick_arrays.rs`|CLMM tick array bitmap computation + unit tests|
+|`crates/meteora-damm/src/models.rs`|All Meteora DAMM model types (V1, V2, VaultAuthority)|
+|`crates/pumpfun-amm/src/pda.rs`|10 PDA derivation functions for Pumpfun accounts|
+|`crates/aggregator/src/loader.rs`|Async RPC pool loading for all 6 DEXs (discriminator + memcmp filters)|
+|`crates/aggregator/src/router.rs`|Multi-hop route finding (BFS, hub-first, liquidity filtering)|
+|`crates/aggregator/src/transaction.rs`|Versioned transaction builder (v0, multi-hop composition)|
+|`crates/aggregator/src/price.rs`|Token pricing via pool graph + CoinGecko API fallback|
+|`crates/aggregator/src/cli.rs`|Progress bars (indicatif) + interactive REPL (rustyline)|
+|`tests/trade_stream.rs`|Live DEX swap streaming via Yellowstone gRPC|
+|`tests/creation_stream.rs`|Live token + pool creation streaming via Yellowstone gRPC|
 
 ## Runtime / Tooling
 
@@ -211,6 +276,7 @@ impl Market for SomeDexMarket {
 - **No `rustfmt.toml`, `clippy.toml`, or `.cargo/config.toml`** -- default rules
 - **All dependency versions** centralized in root `[workspace.dependencies]`
 - **7 workspace dependencies total:** `serde`, `solana-sdk`, `solana-pubkey`, `solana-system-interface`, `spl-associated-token-account`, `spl-token`, `borsh`
+- **Aggregator dependencies:** `tokio`, `futures`, `solana-rpc-client`, `solana-rpc-client-api`, `solana-account-decoder-client-types`, `solana-commitment-config`, `indicatif`, `rustyline`, `sysinfo`, `reqwest`, `serde_json`
 - **Dev dependencies** (tests only): `tokio`, `futures`, `dotenvy`, `yellowstone-grpc-client`, `yellowstone-grpc-proto`, `solana-rpc-client`, `solana-rpc-client-api`, `solana-commitment-config`, `solana-account-decoder-client-types`
 
 ## Testing
@@ -221,10 +287,12 @@ impl Market for SomeDexMarket {
 
 ### Integration Tests
 
-Two Geyser-based streaming tests in `tests/`. Require `GEYSER_ENDPOINT` in `.env`:
+Four Geyser/RPC-based tests in `tests/`. The streaming tests require `GEYSER_ENDPOINT` in `.env`:
 
 - **`trade_stream`** -- Streams live swap transactions. Identifies swaps by discriminator, extracts trader/pool/amounts from token balance changes.
 - **`creation_stream`** -- Streams live token creation (SPL + Token-2022) and pool creation events across all 6 DEXs. Matches pool creation by per-DEX instruction discriminators and extracts pool address, mint pair, and creator.
+- **`pool_financials`** -- Streams live pool account updates across all DEXs, deserializes pool data, fetches mint decimals.
+- **`validate_prices`** -- Validates price calculations across DEX pools.
 
 ### Test Pattern (unit tests)
 
