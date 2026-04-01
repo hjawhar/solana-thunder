@@ -46,11 +46,10 @@ pub type ProgressCallback = Box<dyn Fn(LoadProgress) + Send + Sync>;
 const BALANCE_BATCH_SIZE: usize = 100;
 
 /// Number of balance batches to run concurrently.
-const BALANCE_CONCURRENCY: usize = 10;
+const BALANCE_CONCURRENCY: usize = 20;
 
-/// Per-DEX cap on loaded pools. Prevents runaway loading for DEXs with
-/// hundreds of thousands of pools (e.g., DAMM V2, Pumpfun).
-const MAX_POOLS_PER_DEX: usize = 20_000;
+/// Default per-DEX pool cap. `usize::MAX` = no limit.
+const DEFAULT_MAX_POOLS_PER_DEX: usize = usize::MAX;
 
 /// Hub mints to query pools for. Order matters: WSOL first (most pairs).
 const HUB_MINTS: [&str; 3] = [WSOL, USDC, USDT];
@@ -130,6 +129,7 @@ const DESCRIPTORS: [DexDescriptor; 6] = [
 /// Async loader that discovers pools from on-chain program accounts.
 pub struct PoolLoader {
     rpc: Arc<RpcClient>,
+    max_pools_per_dex: usize,
 }
 
 impl PoolLoader {
@@ -139,7 +139,13 @@ impl PoolLoader {
             Duration::from_secs(300),
             CommitmentConfig::confirmed(),
         ));
-        Self { rpc }
+        Self { rpc, max_pools_per_dex: DEFAULT_MAX_POOLS_PER_DEX }
+    }
+
+    /// Override the per-DEX pool cap. Set to `usize::MAX` for no limit.
+    pub fn with_max_pools(mut self, max: usize) -> Self {
+        self.max_pools_per_dex = max;
+        self
     }
 
     /// Load all pools from all DEXs concurrently.
@@ -189,14 +195,14 @@ impl PoolLoader {
 
         // Query for pools paired with each hub mint, on both mint slots.
         'hub: for hub_mint_str in &HUB_MINTS {
-            if raw_accounts.len() >= MAX_POOLS_PER_DEX {
+            if raw_accounts.len() >= self.max_pools_per_dex {
                 break;
             }
             let hub_mint = Pubkey::from_str_const(hub_mint_str);
             let hub_bytes = hub_mint.to_bytes().to_vec();
 
             for &mint_offset in &[desc.mint_a_offset, desc.mint_b_offset] {
-                if raw_accounts.len() >= MAX_POOLS_PER_DEX {
+                if raw_accounts.len() >= self.max_pools_per_dex {
                     break 'hub;
                 }
                 for &data_size in desc.data_sizes.iter().chain(
@@ -223,12 +229,16 @@ impl PoolLoader {
                         hub_bytes.clone(),
                     )));
 
-                    match self.fetch_filtered(&program, filters).await {
+                    match self.fetch_filtered(&program, filters.clone()).await {
                         Ok(accounts) => {
+                            let count = accounts.len();
                             for (pubkey, account) in accounts {
                                 if seen.insert(pubkey) {
                                     raw_accounts.push((pubkey, account));
                                 }
+                            }
+                            if count > 0 {
+                                eprintln!("{dex}: fetched {count} pools (hub={hub_mint_str}, offset={mint_offset})");
                             }
                         }
                         Err(e) => {
@@ -239,7 +249,25 @@ impl PoolLoader {
                                 )));
                                 return Ok(vec![]);
                             }
-                            eprintln!("{dex}: query error (mint_offset={mint_offset}, hub={hub_mint_str}): {e}");
+                            // Full fetch failed (likely response too large).
+                            // Fall back to two-phase: discover addresses, then batch-fetch.
+                            eprintln!("{dex}: full fetch failed (hub={hub_mint_str}, offset={mint_offset}), trying two-phase...");
+                            match self.two_phase_fetch(&program, filters, dex, cb).await {
+                                Ok(accounts) => {
+                                    let count = accounts.len();
+                                    for (pubkey, account) in accounts {
+                                        if seen.insert(pubkey) {
+                                            raw_accounts.push((pubkey, account));
+                                        }
+                                    }
+                                    if count > 0 {
+                                        eprintln!("{dex}: two-phase fetched {count} pools");
+                                    }
+                                }
+                                Err(e2) => {
+                                    eprintln!("{dex}: two-phase also failed: {e2}");
+                                }
+                            }
                         }
                     }
                 }
@@ -257,10 +285,10 @@ impl PoolLoader {
             return Ok(vec![]);
         }
 
-        // Cap pool count to avoid runaway loading for mega-large DEXs.
-        if raw_accounts.len() > MAX_POOLS_PER_DEX {
-            eprintln!("{dex}: capping at {MAX_POOLS_PER_DEX} pools (discovered {})", raw_accounts.len());
-            raw_accounts.truncate(MAX_POOLS_PER_DEX);
+        // Cap pool count if configured (default: no cap).
+        if raw_accounts.len() > self.max_pools_per_dex {
+            eprintln!("{dex}: capping at {} pools (discovered {})", self.max_pools_per_dex, raw_accounts.len());
+            raw_accounts.truncate(self.max_pools_per_dex);
         }
 
         let total = raw_accounts.len();
@@ -571,6 +599,74 @@ impl PoolLoader {
             .await?;
 
         Ok(accounts)
+    }
+
+    /// Two-phase fetch: discover addresses with dataSlice (lightweight),
+    /// then batch-fetch full account data via getMultipleAccounts.
+    /// Used as fallback when full getProgramAccounts response is too large.
+    async fn two_phase_fetch(
+        &self,
+        program_id: &Pubkey,
+        filters: Vec<RpcFilterType>,
+        dex: &str,
+        cb: &ProgressCallback,
+    ) -> Result<Vec<(Pubkey, Account)>, GenericError> {
+        // Phase 1: discover addresses (fetch only 8 bytes per account)
+        let config = RpcProgramAccountsConfig {
+            filters: Some(filters),
+            account_config: RpcAccountInfoConfig {
+                encoding: Some(UiAccountEncoding::Base64),
+                commitment: Some(CommitmentConfig::confirmed()),
+                data_slice: Some(solana_account_decoder_client_types::UiDataSliceConfig {
+                    offset: 0,
+                    length: 8,
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let addresses: Vec<Pubkey> = self
+            .rpc
+            .get_program_accounts_with_config(program_id, config)
+            .await?
+            .into_iter()
+            .map(|(pubkey, _)| pubkey)
+            .collect();
+
+        eprintln!("{dex}: discovered {} addresses, batch-fetching full data...", addresses.len());
+
+        // Phase 2: batch-fetch full account data
+        let mut results: Vec<(Pubkey, Account)> = Vec::with_capacity(addresses.len());
+        let chunks: Vec<&[Pubkey]> = addresses.chunks(BALANCE_BATCH_SIZE).collect();
+
+        for window in chunks.chunks(BALANCE_CONCURRENCY) {
+            let futures: Vec<_> = window
+                .iter()
+                .map(|chunk| self.rpc.get_multiple_accounts(chunk))
+                .collect();
+
+            let batch_results = futures::future::join_all(futures).await;
+
+            for (chunk, result) in window.iter().zip(batch_results) {
+                match result {
+                    Ok(accounts) => {
+                        for (pubkey, maybe_account) in chunk.iter().zip(accounts) {
+                            if let Some(account) = maybe_account {
+                                results.push((*pubkey, account));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("{dex}: batch fetch error: {e}");
+                    }
+                }
+            }
+
+            cb(progress(dex, LoadPhase::FetchingPools));
+        }
+
+        Ok(results)
     }
 
     /// Batch-fetch SPL token balances for a list of vault pubkeys.
