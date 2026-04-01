@@ -14,6 +14,8 @@ use thunder_core::Market;
 pub struct PoolEntry {
     pub market: Box<dyn Market>,
     pub dex_name: String,
+    /// Serialized pool data for disk cache (bincode of CachedPool variant).
+    pub cached_data: Vec<u8>,
 }
 
 impl fmt::Debug for PoolEntry {

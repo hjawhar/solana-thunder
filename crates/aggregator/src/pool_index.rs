@@ -113,4 +113,9 @@ impl PoolIndex {
     pub fn all_mints(&self) -> Vec<Pubkey> {
         self.edges.keys().copied().collect()
     }
+
+    /// Iterate over all (address, PoolEntry) pairs.
+    pub fn iter_pools(&self) -> impl Iterator<Item = (&str, &PoolEntry)> {
+        self.pools.iter().map(|(k, v)| (k.as_str(), v))
+    }
 }

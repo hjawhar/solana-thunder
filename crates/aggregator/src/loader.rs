@@ -6,7 +6,6 @@
 //! using memcmp filters. If a full fetch fails (response too large), fall back
 //! to two-phase: discover addresses with dataSlice, then batch-fetch full data.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,15 +19,16 @@ use solana_rpc_client_api::filter::{Memcmp, RpcFilterType};
 use solana_sdk::account::Account;
 
 use meteora_damm::{
-    derive_token_vault_address, MeteoraDAMMMarket, MeteoraDAMMPool, MeteoraDAMMV2Market,
+    derive_token_vault_address, MeteoraDAMMPool,
     MeteoraDAMMV2Pool, METEORA_DYNAMIC_AMM, METEORA_DYNAMIC_AMM_V2,
 };
-use meteora_dlmm::{MeteoraDlmmMarket, MeteoraDLMMPool, METEORA_DYNAMIC_LMM};
-use pumpfun_amm::{PumpfunAmmMarket, PumpfunAmmPool, PUMPFUN_AMM_PROGRAM};
-use raydium_amm_v4::{RaydiumAmmV4Market, RaydiumAMMV4, RAYDIUM_LIQUIDITY_POOL_V4};
-use raydium_clmm::{RaydiumClmmMarket, RaydiumCLMMPool, RAYDIUM_CLMM};
-use thunder_core::{GenericError, USDC, USDT, WSOL};
+use meteora_dlmm::{MeteoraDLMMPool, METEORA_DYNAMIC_LMM};
+use pumpfun_amm::{PumpfunAmmPool, PUMPFUN_AMM_PROGRAM};
+use raydium_amm_v4::{RaydiumAMMV4, RAYDIUM_LIQUIDITY_POOL_V4};
+use raydium_clmm::{RaydiumCLMMPool, RAYDIUM_CLMM};
+use thunder_core::GenericError;
 
+use crate::cache::CachedPool;
 use crate::pool_index::PoolIndex;
 use crate::types::{LoadPhase, LoadProgress, PoolEntry};
 
@@ -37,7 +37,6 @@ pub type ProgressCallback = Box<dyn Fn(LoadProgress) + Send + Sync>;
 const BALANCE_BATCH_SIZE: usize = 100;
 const BALANCE_CONCURRENCY: usize = 20;
 const DEFAULT_MAX_POOLS_PER_DEX: usize = usize::MAX;
-const HUB_MINTS: [&str; 3] = [WSOL, USDC, USDT];
 
 // Anchor discriminators (SHA256("account:<Name>")[0..8])
 const DISC_POOL_STATE: [u8; 8] = [247, 237, 227, 245, 215, 195, 222, 70]; // Raydium CLMM
@@ -47,10 +46,10 @@ const DISC_LB_PAIR: [u8; 8] = [33, 11, 49, 98, 181, 101, 177, 13]; // Meteora DL
 struct DexDescriptor {
     name: &'static str,
     program_id: &'static str,
+    /// Account sizes to query. Empty = no dataSize filter (discriminator only).
     data_sizes: &'static [u64],
+    /// Anchor discriminator (first 8 bytes). None for non-Anchor (Raydium V4).
     discriminator: Option<[u8; 8]>,
-    mint_a_offset: u64,
-    mint_b_offset: u64,
 }
 
 const DESCRIPTORS: [DexDescriptor; 6] = [
@@ -59,48 +58,36 @@ const DESCRIPTORS: [DexDescriptor; 6] = [
         program_id: RAYDIUM_LIQUIDITY_POOL_V4,
         data_sizes: &[752],
         discriminator: None,
-        mint_a_offset: 400,
-        mint_b_offset: 432,
     },
     DexDescriptor {
         name: "Raydium CLMM",
         program_id: RAYDIUM_CLMM,
         data_sizes: &[1544],
         discriminator: Some(DISC_POOL_STATE),
-        mint_a_offset: 73,
-        mint_b_offset: 105,
     },
     DexDescriptor {
         name: "Meteora DAMM V1",
         program_id: METEORA_DYNAMIC_AMM,
         data_sizes: &[944],
         discriminator: Some(DISC_POOL),
-        mint_a_offset: 40,
-        mint_b_offset: 72,
     },
     DexDescriptor {
         name: "Meteora DAMM V2",
         program_id: METEORA_DYNAMIC_AMM_V2,
         data_sizes: &[1112],
         discriminator: Some(DISC_POOL),
-        mint_a_offset: 168,
-        mint_b_offset: 200,
     },
     DexDescriptor {
         name: "Meteora DLMM",
         program_id: METEORA_DYNAMIC_LMM,
         data_sizes: &[904],
         discriminator: Some(DISC_LB_PAIR),
-        mint_a_offset: 88,
-        mint_b_offset: 120,
     },
     DexDescriptor {
         name: "Pumpfun AMM",
         program_id: PUMPFUN_AMM_PROGRAM,
         data_sizes: &[],
         discriminator: Some(DISC_POOL),
-        mint_a_offset: 43,
-        mint_b_offset: 75,
     },
 ];
 
@@ -160,67 +147,39 @@ impl PoolLoader {
         cb(progress(dex, LoadPhase::FetchingPools));
 
         let program = Pubkey::from_str_const(desc.program_id);
-        let mut seen = HashSet::new();
         let mut raw_accounts: Vec<(Pubkey, Account)> = Vec::new();
 
-        'hub: for hub_mint_str in &HUB_MINTS {
-            if raw_accounts.len() >= self.max_pools_per_dex {
-                break;
+        // One query per data_size. Filters: discriminator + dataSize only (no mint filter).
+        for &data_size in desc.data_sizes.iter().chain(
+            if desc.data_sizes.is_empty() { [0u64].iter() } else { [].iter() },
+        ) {
+            let mut filters = Vec::new();
+            if data_size > 0 {
+                filters.push(RpcFilterType::DataSize(data_size));
             }
-            let hub_mint = Pubkey::from_str_const(hub_mint_str);
-            let hub_bytes = hub_mint.to_bytes().to_vec();
+            if let Some(disc) = &desc.discriminator {
+                filters.push(RpcFilterType::Memcmp(Memcmp::new_raw_bytes(0, disc.to_vec())));
+            }
 
-            for &mint_offset in &[desc.mint_a_offset, desc.mint_b_offset] {
-                if raw_accounts.len() >= self.max_pools_per_dex {
-                    break 'hub;
-                }
-                for &data_size in desc.data_sizes.iter().chain(
-                    if desc.data_sizes.is_empty() { [0u64].iter() } else { [].iter() },
-                ) {
-                    let mut filters = Vec::new();
-                    if data_size > 0 {
-                        filters.push(RpcFilterType::DataSize(data_size));
+            let fetched = match self.fetch_filtered(&program, filters.clone()).await {
+                Ok(accounts) => accounts,
+                Err(e) => {
+                    let msg = e.to_string();
+                    if msg.contains("excluded from account secondary indexes") {
+                        cb(progress(dex, LoadPhase::Error(
+                            "Program excluded from RPC indexes".into(),
+                        )));
+                        return Ok(vec![]);
                     }
-                    if let Some(disc) = &desc.discriminator {
-                        filters.push(RpcFilterType::Memcmp(Memcmp::new_raw_bytes(0, disc.to_vec())));
-                    }
-                    filters.push(RpcFilterType::Memcmp(Memcmp::new_raw_bytes(
-                        mint_offset as usize,
-                        hub_bytes.clone(),
-                    )));
-
-                    // Try full fetch; fall back to two-phase on failure.
-                    let fetched = match self.fetch_filtered(&program, filters.clone()).await {
+                    // Response too large — try two-phase.
+                    match self.two_phase_fetch(&program, filters, dex, cb).await {
                         Ok(accounts) => accounts,
-                        Err(e) => {
-                            let msg = e.to_string();
-                            if msg.contains("excluded from account secondary indexes") {
-                                cb(progress(dex, LoadPhase::Error(
-                                    "Program excluded from RPC indexes".into(),
-                                )));
-                                return Ok(vec![]);
-                            }
-                            // Response too large — try two-phase.
-                            match self.two_phase_fetch(&program, filters, dex, cb).await {
-                                Ok(accounts) => accounts,
-                                Err(_) => continue, // Skip this query entirely.
-                            }
-                        }
-                    };
-
-                    for (pubkey, account) in fetched {
-                        if seen.insert(pubkey) {
-                            raw_accounts.push((pubkey, account));
-                        }
+                        Err(_) => continue,
                     }
                 }
-            }
+            };
 
-            // Update progress after each hub mint.
-            cb(progress(dex, LoadPhase::Deserializing {
-                done: raw_accounts.len(),
-                total: raw_accounts.len(),
-            }));
+            raw_accounts.extend(fetched);
         }
 
         if raw_accounts.is_empty() {
@@ -273,8 +232,7 @@ impl PoolLoader {
         cb(progress(dex, LoadPhase::FetchingBalances { done: 0, total: pools.len() }));
         let balances = self.batch_fetch_balances(&vault_keys, dex, cb).await?;
         Ok(pools.into_iter().enumerate().map(|(i, (addr, pool))| {
-            let market = RaydiumAmmV4Market::new(pool, addr.clone(), balances[i * 2 + 1], balances[i * 2]);
-            (addr, PoolEntry { market: Box::new(market), dex_name: dex.to_string() })
+            CachedPool::RaydiumV4 { addr, pool, quote_bal: balances[i*2+1], base_bal: balances[i*2] }.into_pool_entry()
         }).collect())
     }
 
@@ -290,10 +248,7 @@ impl PoolLoader {
         cb(progress(dex, LoadPhase::FetchingBalances { done: 0, total: pools.len() }));
         let balances = self.batch_fetch_balances(&vault_keys, dex, cb).await?;
         Ok(pools.into_iter().enumerate().map(|(i, (addr, pool))| {
-            let mut market = RaydiumClmmMarket::new(pool, addr.clone());
-            market.vault_0_balance = balances[i * 2];
-            market.vault_1_balance = balances[i * 2 + 1];
-            (addr, PoolEntry { market: Box::new(market), dex_name: dex.to_string() })
+            CachedPool::RaydiumClmm { addr, pool, v0_bal: balances[i*2], v1_bal: balances[i*2+1] }.into_pool_entry()
         }).collect())
     }
 
@@ -311,10 +266,7 @@ impl PoolLoader {
         cb(progress(dex, LoadPhase::FetchingBalances { done: 0, total: pools.len() }));
         let balances = self.batch_fetch_balances(&vault_keys, dex, cb).await?;
         Ok(pools.into_iter().enumerate().map(|(i, (addr, pool))| {
-            let mut market = MeteoraDAMMMarket::new(pool, addr.clone());
-            market.a_vault_balance = balances[i * 2];
-            market.b_vault_balance = balances[i * 2 + 1];
-            (addr, PoolEntry { market: Box::new(market), dex_name: dex.to_string() })
+            CachedPool::MeteoraDAMMV1 { addr, pool, a_bal: balances[i*2], b_bal: balances[i*2+1] }.into_pool_entry()
         }).collect())
     }
 
@@ -330,10 +282,7 @@ impl PoolLoader {
         cb(progress(dex, LoadPhase::FetchingBalances { done: 0, total: pools.len() }));
         let balances = self.batch_fetch_balances(&vault_keys, dex, cb).await?;
         Ok(pools.into_iter().enumerate().map(|(i, (addr, pool))| {
-            let mut market = MeteoraDAMMV2Market::new(pool, addr.clone());
-            market.a_vault_balance = balances[i * 2];
-            market.b_vault_balance = balances[i * 2 + 1];
-            (addr, PoolEntry { market: Box::new(market), dex_name: dex.to_string() })
+            CachedPool::MeteoraDAMMV2 { addr, pool, a_bal: balances[i*2], b_bal: balances[i*2+1] }.into_pool_entry()
         }).collect())
     }
 
@@ -349,24 +298,17 @@ impl PoolLoader {
         cb(progress(dex, LoadPhase::FetchingBalances { done: 0, total: pools.len() }));
         let balances = self.batch_fetch_balances(&vault_keys, dex, cb).await?;
         Ok(pools.into_iter().enumerate().map(|(i, (addr, pool))| {
-            let mut market = MeteoraDlmmMarket::new(pool, addr.clone());
-            market.reserve_x_balance = balances[i * 2];
-            market.reserve_y_balance = balances[i * 2 + 1];
-            (addr, PoolEntry { market: Box::new(market), dex_name: dex.to_string() })
+            CachedPool::MeteoraDLMM { addr, pool, rx_bal: balances[i*2], ry_bal: balances[i*2+1] }.into_pool_entry()
         }).collect())
     }
 
     async fn build_pumpfun(&self, accounts: Vec<(Pubkey, Account)>, cb: &ProgressCallback) -> Result<Vec<(String, PoolEntry)>, GenericError> {
         let dex = "Pumpfun AMM";
-        let mut entries = Vec::new();
         let total = accounts.len();
+        let mut entries = Vec::new();
         for (i, (pubkey, account)) in accounts.iter().enumerate() {
             if let Ok(pool) = deser_anchor::<PumpfunAmmPool>(&account.data) {
-                let market = PumpfunAmmMarket::new(pool, pubkey.to_string());
-                entries.push((pubkey.to_string(), PoolEntry {
-                    market: Box::new(market),
-                    dex_name: dex.to_string(),
-                }));
+                entries.push(CachedPool::PumpfunAmm { addr: pubkey.to_string(), pool }.into_pool_entry());
             }
             if (i + 1) % 5000 == 0 || i + 1 == total {
                 cb(progress(dex, LoadPhase::BuildingMarkets { done: i + 1, total }));

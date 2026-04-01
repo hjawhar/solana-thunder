@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Solana Thunder is a Rust DEX aggregator for Solana. It consists of 6 pure DEX crates that parse on-chain account data and build swap instructions through a unified `Market` trait, plus an aggregator crate that loads pools from RPC, finds multi-hop routes, builds versioned transactions, and exposes an interactive CLI. The DEX crates are pure -- no RPC calls, no async, no I/O. The aggregator crate handles all I/O.
+Solana Thunder is a Rust DEX aggregator for Solana. It consists of 6 pure DEX crates that parse on-chain account data and build swap instructions through a unified `Market` trait, plus an aggregator crate that loads all pools from RPC, finds multi-hop routes, builds versioned transactions, and exposes an interactive CLI. The DEX crates are pure -- no RPC calls, no async, no I/O. The aggregator crate handles all I/O. No external APIs -- all data is on-chain.
 
 ## Architecture
 
@@ -19,7 +19,7 @@ thunder-core          Market trait, shared types, constants
     +-- meteora-dlmm      Dynamic liquidity bins
     +-- pumpfun-amm       Bonding curve (virtual reserves)
 
-thunder-aggregator    Aggregator: pool loading, routing, pricing, CLI
+thunder-aggregator    Aggregator: pool loading, routing, pricing, caching, CLI
     depends on: all DEX crates + thunder-core + solana-rpc-client + tokio
 
 solana-thunder        Root crate: re-exports all DEX crates
@@ -58,10 +58,18 @@ The caller is responsible for:
 ### Aggregator Data Flow
 
 ```
-RPC getProgramAccounts --> deserialize per-DEX --> PoolIndex (token graph)
-     (disc + mint memcmp)                              |
-                                                       v
-User query (A->B, amount) --> Router (BFS, max 3 hops) --> simulate all paths
+Cache file (pools.cache)                  RPC getProgramAccounts
+     |                                         (disc + dataSize filters)
+     v                                         |
+Load from disk (6s)  -- OR --  Load from RPC (3-4 min) + save cache
+     |                                         |
+     +------- PoolIndex (token graph) ---------+
+                      |
+                      v
+SOL/USD price <-- on-chain CLMM sqrt_price (highest-liquidity SOL/USDC pool)
+                      |
+                      v
+User query (A->B, amount) --> Router (BFS, 1-4 hops, bidirectional) --> simulate all paths
                                                        |
                                                   best route
                                                        |
@@ -99,9 +107,10 @@ solana-thunder/
 |       +-- types.rs                    # PoolEntry, Route, RouteHop, Quote, TokenPrice, etc.
 |       +-- pool_index.rs              # In-memory token-pair graph (mint adjacency list)
 |       +-- loader.rs                   # Async RPC pool loading for all 6 DEXs
-|       +-- router.rs                   # Multi-hop route finding (BFS, 1-3 hops)
+|       +-- cache.rs                    # Disk cache: save/load pools as binary (bincode)
+|       +-- router.rs                   # Multi-hop route finding (BFS, 1-4 hops, bidirectional)
 |       +-- transaction.rs              # Versioned transaction builder (v0)
-|       +-- price.rs                    # Token price oracle (SOL/USD on-chain via CLMM sqrt_price)
+|       +-- price.rs                    # SOL/USD on-chain via CLMM sqrt_price, per-token via pools
 |       +-- stats.rs                    # Pool and system resource statistics
 |       +-- cli.rs                      # Progress bars + interactive REPL
 +-- tests/
@@ -125,18 +134,49 @@ cargo build --release -p thunder-aggregator  # Build aggregator binary (release)
 ### Running the Aggregator
 
 ```bash
-# Run with an RPC endpoint
+# Run with an RPC endpoint (first run loads from RPC, saves cache)
+RPC_URL="https://your-rpc-endpoint.com" cargo run --release -p thunder-aggregator
+
+# Subsequent runs load from cache (~6s instead of ~4min)
 RPC_URL="https://your-rpc-endpoint.com" cargo run --release -p thunder-aggregator
 
 # Or run the built binary directly
 RPC_URL="https://your-rpc-endpoint.com" ./target/release/thunder-agg
 ```
 
+Environment variables:
+
+| Variable | Default | Description |
+|---|---|---|
+| `RPC_URL` | `https://api.mainnet-beta.solana.com` | Solana RPC endpoint |
+| `CACHE_PATH` | `pools.cache` | Pool cache file location |
+| `CACHE_MAX_AGE` | `3600` | Max cache age in seconds before forcing RPC reload. Set to `0` to always reload. |
+| `PRIVATE_KEY` | (none) | Base58 keypair for swap simulation (never sent, only `simulateTransaction`) |
+
 The aggregator will:
 1. Fetch SOL/USD price on-chain from the highest-liquidity Raydium CLMM SOL/USDC pool's `sqrt_price_x64`
-2. Load all pools from all 6 DEXs via `getProgramAccounts` (with progress bars)
-3. Build an in-memory token-pair graph (~2M pools, ~1.7M tokens)
+2. Load pools from cache if fresh, otherwise from RPC (all pools, no mint filter)
+3. Save cache to disk for next startup
 4. Enter an interactive REPL
+
+### Pool Loading
+
+Fetches ALL pools from all 6 DEXs using `getProgramAccounts` with discriminator + dataSize filters only (no mint filter). Every pool across every token pair is loaded. Typical counts:
+
+| DEX | Pools |
+|---|---|
+| Meteora DAMM V2 | ~874K |
+| Pumpfun AMM | ~829K |
+| Raydium CLMM | ~170K |
+| Meteora DLMM | ~140K |
+| Meteora DAMM V1 | ~16K |
+| **Total** | **~2M** |
+
+Vault balances fetched via `getMultipleAccounts` in batches of 100, 20 concurrent.
+
+### Pool Cache
+
+On first run, pools are saved to `pools.cache` (~1.6 GB for 2M pools). On subsequent runs, the cache is loaded in ~6 seconds instead of ~4 minutes from RPC. The cache stores serialized pool structs + vault balances via bincode -- everything needed to reconstruct `Box<dyn Market>` with zero RPC calls.
 
 ### REPL Commands
 
@@ -148,6 +188,16 @@ thunder> route SOL <to_mint> 1.0                        # Find best routes for 1
 thunder> route <from_mint> <to_mint> <amount>           # Route between any tokens
 thunder> stats                                          # Pool counts, memory, uptime
 thunder> exit                                           # Exit
+```
+
+### Examples
+
+```bash
+# Test on-chain SOL/USD price
+RPC_URL="https://..." cargo run -p thunder-aggregator --example test_price
+
+# Simulate a swap (requires PRIVATE_KEY in .env, NEVER sends)
+RPC_URL="https://..." cargo run --release -p thunder-aggregator --example simulate_swap
 ```
 
 ### Integration Tests (require Geyser endpoint)
@@ -201,6 +251,7 @@ impl Market for SomeDexMarket {
 |---|---|---|
 |On-chain account data|`borsh`|`BorshDeserialize` on pool model structs. 8-byte discriminator skip for Anchor programs.|
 |Instruction args|`borsh`|`BorshSerialize` with hand-crafted discriminator prefix.|
+|Disk cache|`bincode`|`CachedPool` enum with all DEX pool variants. Saved/loaded via `cache::save_cache`/`load_cache`.|
 |Cache/API|`serde`|`Serialize, Deserialize` derives on all public types.|
 
 ### Constants
@@ -241,16 +292,18 @@ impl Market for SomeDexMarket {
 |Meteora DLMM|`init_cust_perm_lb_pair2`|`[243,73,129,126,51,19,241,107]`|0|2|3|
 |Pumpfun AMM|`create_pool`|`[233,146,209,142,207,104,64,188]`|0|3|4|
 
-### Pool Discovery Memcmp Offsets
+### Pool Discovery Filters
 
-|DEX|Program ID|data_size|Mint offsets|Anchor Discriminator|
-|---|---|---|---|---|
-|Raydium V4|`675kPX...`|752|400, 432|None (no Anchor)|
-|Raydium CLMM|`CAMMC...`|1544|73, 105|`[247,237,227,245,215,195,222,70]` (PoolState)|
-|Meteora DAMM V1|`Eo7Wj...`|944|40, 72|`[241,154,109,4,17,177,109,188]` (Pool)|
-|Meteora DAMM V2|`cpamd...`|1112|168, 200|`[241,154,109,4,17,177,109,188]` (Pool)|
-|Meteora DLMM|`LBUZKh...`|904|88, 120|`[33,11,49,98,181,101,177,13]` (LbPair)|
-|Pumpfun AMM|`pAMMB...`|N/A|43, 75|`[241,154,109,4,17,177,109,188]` (Pool)|
+The aggregator fetches ALL pools using discriminator + dataSize filters only (no mint filter):
+
+|DEX|Program ID|data_size|Anchor Discriminator|
+|---|---|---|---|
+|Raydium V4|`675kPX...`|752|None (no Anchor)|
+|Raydium CLMM|`CAMMC...`|1544|`[247,237,227,245,215,195,222,70]` (PoolState)|
+|Meteora DAMM V1|`Eo7Wj...`|944|`[241,154,109,4,17,177,109,188]` (Pool)|
+|Meteora DAMM V2|`cpamd...`|1112|`[241,154,109,4,17,177,109,188]` (Pool)|
+|Meteora DLMM|`LBUZKh...`|904|`[33,11,49,98,181,101,177,13]` (LbPair)|
+|Pumpfun AMM|`pAMMB...`|N/A|`[241,154,109,4,17,177,109,188]` (Pool)|
 
 ## Important Files
 
@@ -261,11 +314,14 @@ impl Market for SomeDexMarket {
 |`crates/raydium-clmm/src/tick_arrays.rs`|CLMM tick array bitmap computation + unit tests|
 |`crates/meteora-damm/src/models.rs`|All Meteora DAMM model types (V1, V2, VaultAuthority)|
 |`crates/pumpfun-amm/src/pda.rs`|10 PDA derivation functions for Pumpfun accounts|
-|`crates/aggregator/src/loader.rs`|Async RPC pool loading for all 6 DEXs (discriminator + memcmp filters)|
-|`crates/aggregator/src/router.rs`|Multi-hop route finding (BFS, hub-first, liquidity filtering)|
+|`crates/aggregator/src/loader.rs`|Async RPC pool loading for all 6 DEXs (discriminator + dataSize filters)|
+|`crates/aggregator/src/cache.rs`|Disk cache: save/load 2M pools as bincode binary (~1.6 GB, loads in ~6s)|
+|`crates/aggregator/src/router.rs`|Multi-hop route finding (BFS, 1-4 hops, bidirectional neighbor search)|
 |`crates/aggregator/src/transaction.rs`|Versioned transaction builder (v0, multi-hop composition)|
-|`crates/aggregator/src/price.rs`|Token pricing: SOL/USD on-chain via CLMM `sqrt_price_x64`, per-token via pool graph|
+|`crates/aggregator/src/price.rs`|SOL/USD on-chain via CLMM `sqrt_price_x64`, per-token via pool graph|
 |`crates/aggregator/src/cli.rs`|Progress bars (indicatif) + interactive REPL (rustyline)|
+|`crates/aggregator/examples/test_price.rs`|Standalone on-chain SOL/USD price test|
+|`crates/aggregator/examples/simulate_swap.rs`|Swap simulation (build + simulateTransaction, never sends)|
 |`tests/trade_stream.rs`|Live DEX swap streaming via Yellowstone gRPC|
 |`tests/creation_stream.rs`|Live token + pool creation streaming via Yellowstone gRPC|
 
@@ -276,7 +332,7 @@ impl Market for SomeDexMarket {
 - **No `rustfmt.toml`, `clippy.toml`, or `.cargo/config.toml`** -- default rules
 - **All dependency versions** centralized in root `[workspace.dependencies]`
 - **7 workspace dependencies total:** `serde`, `solana-sdk`, `solana-pubkey`, `solana-system-interface`, `spl-associated-token-account`, `spl-token`, `borsh`
-- **Aggregator dependencies:** `tokio`, `futures`, `solana-rpc-client`, `solana-rpc-client-api`, `solana-account-decoder-client-types`, `solana-commitment-config`, `indicatif`, `rustyline`, `sysinfo`
+- **Aggregator dependencies:** `tokio`, `futures`, `solana-rpc-client`, `solana-rpc-client-api`, `solana-account-decoder-client-types`, `solana-commitment-config`, `indicatif`, `rustyline`, `sysinfo`, `bincode`
 - **Dev dependencies** (tests only): `tokio`, `futures`, `dotenvy`, `yellowstone-grpc-client`, `yellowstone-grpc-proto`, `solana-rpc-client`, `solana-rpc-client-api`, `solana-commitment-config`, `solana-account-decoder-client-types`
 
 ## Testing

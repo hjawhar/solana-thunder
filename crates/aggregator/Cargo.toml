@@ -36,5 +36,10 @@ solana-commitment-config = "3.0"
 indicatif = "0.17"
 rustyline = "15"
 
-# Stats
+# Serialization / stats
 sysinfo = "0.34"
+bincode = "1.3"
+
+[dev-dependencies]
+dotenvy = "0.15"
+bincode = "1.3"

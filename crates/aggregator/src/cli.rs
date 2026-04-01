@@ -218,7 +218,7 @@ fn cmd_route(index: &PoolIndex, parts: &[&str]) {
         }
     };
 
-    let router = Router::new(index, 3);
+    let router = Router::new(index, 4);
     match router.find_routes(from_mint, to_mint, amount, 5) {
         Ok(quote) => {
             if quote.routes.is_empty() {

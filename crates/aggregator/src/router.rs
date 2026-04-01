@@ -1,7 +1,8 @@
-//! Multi-hop route discovery: finds optimal paths between any two tokens.
+//! Multi-hop route discovery: finds optimal swap paths between any two tokens.
 //!
-//! Searches direct (1-hop), 2-hop (via hub or neighbor), and 3-hop routes,
-//! then ranks by output amount descending.
+//! Searches 1-hop through 4-hop routes using hub mints and bidirectional
+//! neighbor exploration. All candidate paths are simulated end-to-end with
+//! the actual input amount, then ranked by output amount descending.
 
 use std::collections::HashSet;
 
@@ -11,21 +12,19 @@ use thunder_core::{GenericError, SwapDirection, JITOSOL, MSOL, USDC, USDT, WSOL}
 use crate::pool_index::PoolIndex;
 use crate::types::{Quote, Route, RouteHop};
 
-/// Hub mints used for multi-hop routing (highest liquidity tokens).
+/// Hub mints — high-liquidity tokens used as intermediate routing nodes.
 const HUB_MINTS: [&str; 5] = [WSOL, USDC, USDT, JITOSOL, MSOL];
 
-/// Tighter hub set for 3-hop routes to bound combinatorial explosion.
-const HUB_MINTS_3HOP: [&str; 3] = [WSOL, USDC, USDT];
+/// Smaller hub set for higher-hop routes to bound search space.
+const HUB_MINTS_CORE: [&str; 3] = [WSOL, USDC, USDT];
 
-/// Max intermediate mints explored for neighbor-based 2-hop search.
-const MAX_INTERMEDIATE_CANDIDATES: usize = 50;
+/// Max neighbors explored per side in bidirectional search.
+const MAX_NEIGHBOR_CANDIDATES: usize = 200;
 
 /// Minimum vault balance (raw units) for a pool to be routable.
-/// Pools with both vaults below this are skipped as dust.
-const MIN_VAULT_BALANCE: u64 = 10_000_000; // 0.01 SOL / 10 USDC
+const MIN_VAULT_BALANCE: u64 = 10_000_000; // 0.01 SOL
 
 /// Maximum acceptable price impact (bps) for a single hop.
-/// Routes through pools with higher impact are discarded.
 const MAX_HOP_IMPACT_BPS: u64 = 5000; // 50%
 
 pub struct Router<'a> {
@@ -54,75 +53,68 @@ impl<'a> Router<'a> {
 
         let mut candidates: Vec<Route> = Vec::new();
 
-        // --- 1-hop: direct pools ---
+        let hubs: Vec<Pubkey> = HUB_MINTS
+            .iter()
+            .map(|s| Pubkey::from_str_const(s))
+            .filter(|h| *h != input_mint && *h != output_mint)
+            .collect();
+
+        let core_hubs: Vec<Pubkey> = HUB_MINTS_CORE
+            .iter()
+            .map(|s| Pubkey::from_str_const(s))
+            .filter(|h| *h != input_mint && *h != output_mint)
+            .collect();
+
+        // === 1-hop: direct pools ===
         if self.max_hops >= 1 {
             self.find_direct(&input_mint, &output_mint, amount_in, &mut candidates);
         }
 
-        // --- 2-hop: via hub mints ---
+        // === 2-hop ===
         if self.max_hops >= 2 {
-            let hub_pubkeys: Vec<Pubkey> = HUB_MINTS
-                .iter()
-                .map(|s| Pubkey::from_str_const(s))
-                .collect();
-
-            for hub in &hub_pubkeys {
-                if *hub == input_mint || *hub == output_mint {
-                    continue;
-                }
-                self.find_2hop(
-                    &input_mint,
-                    hub,
-                    &output_mint,
-                    amount_in,
-                    &mut candidates,
-                );
+            // Via hub mints
+            for hub in &hubs {
+                self.try_2hop(&input_mint, hub, &output_mint, amount_in, &mut candidates);
             }
 
-            // --- 2-hop: via any neighbor of input_mint ---
-            self.find_2hop_neighbors(
+            // Via neighbors of input_mint (forward search)
+            self.neighbor_2hop_forward(
                 &input_mint,
                 &output_mint,
                 amount_in,
-                &hub_pubkeys,
+                &hubs,
+                &mut candidates,
+            );
+
+            // Via neighbors of output_mint (reverse search)
+            self.neighbor_2hop_reverse(
+                &input_mint,
+                &output_mint,
+                amount_in,
+                &hubs,
                 &mut candidates,
             );
         }
 
-        // --- 3-hop: only if no shorter routes found ---
-        if self.max_hops >= 3 && candidates.is_empty() {
-            let hub3: Vec<Pubkey> = HUB_MINTS_3HOP
-                .iter()
-                .map(|s| Pubkey::from_str_const(s))
-                .collect();
-
-            for (i, h1) in hub3.iter().enumerate() {
-                if *h1 == input_mint || *h1 == output_mint {
-                    continue;
-                }
-                for h2 in &hub3[i + 1..] {
-                    if *h2 == input_mint || *h2 == output_mint || h1 == h2 {
-                        continue;
-                    }
-                    // Try both orderings: input→h1→h2→output and input→h2→h1→output
-                    self.find_3hop(
-                        &input_mint,
-                        h1,
-                        h2,
-                        &output_mint,
-                        amount_in,
-                        &mut candidates,
-                    );
-                    self.find_3hop(
-                        &input_mint,
-                        h2,
-                        h1,
-                        &output_mint,
-                        amount_in,
-                        &mut candidates,
-                    );
+        // === 3-hop ===
+        if self.max_hops >= 3 {
+            // Hub-hub: input → hub1 → hub2 → output
+            for (i, h1) in core_hubs.iter().enumerate() {
+                for h2 in &core_hubs[i + 1..] {
+                    self.try_3hop(&input_mint, h1, h2, &output_mint, amount_in, &mut candidates);
+                    self.try_3hop(&input_mint, h2, h1, &output_mint, amount_in, &mut candidates);
                 }
             }
+
+            // Neighbor-hub: input → neighbor → hub → output
+            // and: input → hub → neighbor → output
+            self.neighbor_3hop(&input_mint, &output_mint, amount_in, &core_hubs, &mut candidates);
+        }
+
+        // === 4-hop ===
+        if self.max_hops >= 4 {
+            // input → neighbor_in → hub → neighbor_out → output
+            self.neighbor_4hop(&input_mint, &output_mint, amount_in, &core_hubs, &mut candidates);
         }
 
         // Sort by output amount descending, truncate to max_routes.
@@ -132,95 +124,83 @@ impl<'a> Router<'a> {
         Ok(Quote { routes: candidates })
     }
 
-    // -- private helpers --------------------------------------------------
+    // =====================================================================
+    // Search strategies
+    // =====================================================================
 
-    /// Enumerate all direct (1-hop) routes between two mints.
+    /// All direct (1-hop) routes.
     fn find_direct(
         &self,
-        input_mint: &Pubkey,
-        output_mint: &Pubkey,
+        input: &Pubkey,
+        output: &Pubkey,
         amount_in: u64,
         out: &mut Vec<Route>,
     ) {
-        for addr in self.index.direct_pools(input_mint, output_mint) {
-            if let Some(route) = simulate_path(
-                self.index,
-                &[(addr, *input_mint, *output_mint)],
-                amount_in,
-            ) {
+        for addr in self.index.direct_pools(input, output) {
+            if let Some(route) = simulate_path(self.index, &[(addr, *input, *output)], amount_in) {
                 out.push(route);
             }
         }
     }
 
-    /// Enumerate 2-hop routes through a specific intermediate mint.
-    fn find_2hop(
+    /// 2-hop through a specific intermediate mint. Picks best pool per leg.
+    fn try_2hop(
         &self,
-        input_mint: &Pubkey,
+        input: &Pubkey,
         mid: &Pubkey,
-        output_mint: &Pubkey,
+        output: &Pubkey,
         amount_in: u64,
         out: &mut Vec<Route>,
     ) {
-        let leg1_pools = self.index.direct_pools(input_mint, mid);
-        if leg1_pools.is_empty() {
-            return;
-        }
-        let leg2_pools = self.index.direct_pools(mid, output_mint);
-        if leg2_pools.is_empty() {
+        let leg1 = self.index.direct_pools(input, mid);
+        let leg2 = self.index.direct_pools(mid, output);
+        if leg1.is_empty() || leg2.is_empty() {
             return;
         }
 
-        // Pick best pool per leg to avoid combinatorial blowup.
-        let best_leg1 = best_pool(self.index, &leg1_pools, *input_mint, amount_in);
-        let Some((addr1, mid_amount)) = best_leg1 else {
+        let Some((a1, mid_amount)) = best_pool(self.index, &leg1, *input, amount_in) else {
+            return;
+        };
+        let Some((a2, _)) = best_pool(self.index, &leg2, *mid, mid_amount) else {
             return;
         };
 
-        let best_leg2 = best_pool(self.index, &leg2_pools, *mid, mid_amount);
-        let Some((addr2, _)) = best_leg2 else { return };
-
         if let Some(route) = simulate_path(
             self.index,
-            &[
-                (addr1, *input_mint, *mid),
-                (addr2, *mid, *output_mint),
-            ],
+            &[(a1, *input, *mid), (a2, *mid, *output)],
             amount_in,
         ) {
             out.push(route);
         }
     }
 
-    /// Explore neighbors of input_mint for 2-hop routes via non-hub intermediates.
-    fn find_2hop_neighbors(
+    /// 2-hop: explore neighbors of input_mint (forward search).
+    fn neighbor_2hop_forward(
         &self,
-        input_mint: &Pubkey,
-        output_mint: &Pubkey,
+        input: &Pubkey,
+        output: &Pubkey,
         amount_in: u64,
-        already_tried: &[Pubkey],
+        skip: &[Pubkey],
         out: &mut Vec<Route>,
     ) {
-        let skip: HashSet<Pubkey> = already_tried.iter().copied().collect();
-        let neighbors = self.index.neighbors(input_mint);
+        let skip_set: HashSet<Pubkey> = skip.iter().copied().collect();
         let mut tried = 0usize;
 
-        for (mid, pool_addr) in &neighbors {
-            if tried >= MAX_INTERMEDIATE_CANDIDATES {
+        for (mid, pool_addr) in &self.index.neighbors(input) {
+            if tried >= MAX_NEIGHBOR_CANDIDATES {
                 break;
             }
-            if *mid == *input_mint || *mid == *output_mint || skip.contains(mid) {
+            if *mid == *input || *mid == *output || skip_set.contains(mid) {
                 continue;
             }
 
-            let leg2_pools = self.index.direct_pools(mid, output_mint);
-            if leg2_pools.is_empty() {
+            let leg2 = self.index.direct_pools(mid, output);
+            if leg2.is_empty() {
                 tried += 1;
                 continue;
             }
 
-            // Simulate first hop through the known pool.
-            let Some(hop1) = simulate_hop(self.index, pool_addr, *input_mint, amount_in) else {
+            let Some(hop1) = simulate_hop(self.index, pool_addr, *input, amount_in) else {
                 tried += 1;
                 continue;
             };
@@ -229,19 +209,14 @@ impl<'a> Router<'a> {
                 continue;
             }
 
-            // Pick best second-leg pool.
-            let Some((addr2, _)) = best_pool(self.index, &leg2_pools, *mid, hop1.output_amount)
-            else {
+            let Some((a2, _)) = best_pool(self.index, &leg2, *mid, hop1.output_amount) else {
                 tried += 1;
                 continue;
             };
 
             if let Some(route) = simulate_path(
                 self.index,
-                &[
-                    (pool_addr.clone(), *input_mint, *mid),
-                    (addr2, *mid, *output_mint),
-                ],
+                &[(pool_addr.clone(), *input, *mid), (a2, *mid, *output)],
                 amount_in,
             ) {
                 out.push(route);
@@ -251,55 +226,215 @@ impl<'a> Router<'a> {
         }
     }
 
-    /// Enumerate 3-hop routes through two intermediate hubs.
-    fn find_3hop(
+    /// 2-hop: explore neighbors of output_mint (reverse search).
+    /// For each neighbor `mid` of output, check if input → mid has a pool.
+    fn neighbor_2hop_reverse(
         &self,
-        input_mint: &Pubkey,
+        input: &Pubkey,
+        output: &Pubkey,
+        amount_in: u64,
+        skip: &[Pubkey],
+        out: &mut Vec<Route>,
+    ) {
+        let skip_set: HashSet<Pubkey> = skip.iter().copied().collect();
+        let mut tried = 0usize;
+
+        for (mid, _pool_to_output) in &self.index.neighbors(output) {
+            if tried >= MAX_NEIGHBOR_CANDIDATES {
+                break;
+            }
+            if *mid == *input || *mid == *output || skip_set.contains(mid) {
+                continue;
+            }
+
+            let leg1 = self.index.direct_pools(input, mid);
+            if leg1.is_empty() {
+                tried += 1;
+                continue;
+            }
+
+            // Simulate: input → mid (best pool) → output (best pool)
+            let Some((a1, mid_amount)) = best_pool(self.index, &leg1, *input, amount_in) else {
+                tried += 1;
+                continue;
+            };
+
+            let leg2 = self.index.direct_pools(mid, output);
+            let Some((a2, _)) = best_pool(self.index, &leg2, *mid, mid_amount) else {
+                tried += 1;
+                continue;
+            };
+
+            if let Some(route) = simulate_path(
+                self.index,
+                &[(a1, *input, *mid), (a2, *mid, *output)],
+                amount_in,
+            ) {
+                out.push(route);
+            }
+
+            tried += 1;
+        }
+    }
+
+    /// 3-hop through two specific intermediates.
+    fn try_3hop(
+        &self,
+        input: &Pubkey,
         h1: &Pubkey,
         h2: &Pubkey,
-        output_mint: &Pubkey,
+        output: &Pubkey,
         amount_in: u64,
         out: &mut Vec<Route>,
     ) {
-        let leg1 = self.index.direct_pools(input_mint, h1);
-        if leg1.is_empty() {
-            return;
-        }
-        let leg2 = self.index.direct_pools(h1, h2);
-        if leg2.is_empty() {
-            return;
-        }
-        let leg3 = self.index.direct_pools(h2, output_mint);
-        if leg3.is_empty() {
+        let l1 = self.index.direct_pools(input, h1);
+        let l2 = self.index.direct_pools(h1, h2);
+        let l3 = self.index.direct_pools(h2, output);
+        if l1.is_empty() || l2.is_empty() || l3.is_empty() {
             return;
         }
 
-        let Some((a1, amt1)) = best_pool(self.index, &leg1, *input_mint, amount_in) else {
-            return;
-        };
-        let Some((a2, amt2)) = best_pool(self.index, &leg2, *h1, amt1) else {
-            return;
-        };
-        let Some((a3, _)) = best_pool(self.index, &leg3, *h2, amt2) else {
-            return;
-        };
+        let Some((a1, amt1)) = best_pool(self.index, &l1, *input, amount_in) else { return };
+        let Some((a2, amt2)) = best_pool(self.index, &l2, *h1, amt1) else { return };
+        let Some((a3, _)) = best_pool(self.index, &l3, *h2, amt2) else { return };
 
         if let Some(route) = simulate_path(
             self.index,
-            &[
-                (a1, *input_mint, *h1),
-                (a2, *h1, *h2),
-                (a3, *h2, *output_mint),
-            ],
+            &[(a1, *input, *h1), (a2, *h1, *h2), (a3, *h2, *output)],
             amount_in,
         ) {
             out.push(route);
         }
     }
+
+    /// 3-hop via neighbor + hub.
+    /// Tries: input → neighbor → hub → output  AND  input → hub → neighbor → output.
+    fn neighbor_3hop(
+        &self,
+        input: &Pubkey,
+        output: &Pubkey,
+        amount_in: u64,
+        hubs: &[Pubkey],
+        out: &mut Vec<Route>,
+    ) {
+        // Forward: input → neighbor_of_input → hub → output
+        let mut tried = 0usize;
+        for (mid, _) in &self.index.neighbors(input) {
+            if tried >= MAX_NEIGHBOR_CANDIDATES / 2 {
+                break;
+            }
+            if *mid == *input || *mid == *output || hubs.contains(mid) {
+                continue;
+            }
+            for hub in hubs {
+                self.try_3hop(input, mid, hub, output, amount_in, out);
+            }
+            tried += 1;
+        }
+
+        // Reverse: input → hub → neighbor_of_output → output
+        tried = 0;
+        for (mid, _) in &self.index.neighbors(output) {
+            if tried >= MAX_NEIGHBOR_CANDIDATES / 2 {
+                break;
+            }
+            if *mid == *input || *mid == *output || hubs.contains(mid) {
+                continue;
+            }
+            for hub in hubs {
+                self.try_3hop(input, hub, mid, output, amount_in, out);
+            }
+            tried += 1;
+        }
+    }
+
+    /// 4-hop: input → neighbor_in → hub → neighbor_out → output.
+    /// Meets in the middle at a hub mint.
+    fn neighbor_4hop(
+        &self,
+        input: &Pubkey,
+        output: &Pubkey,
+        amount_in: u64,
+        hubs: &[Pubkey],
+        out: &mut Vec<Route>,
+    ) {
+        // Collect neighbors of input that connect to any hub.
+        let in_neighbors: Vec<(Pubkey, String)> = self
+            .index
+            .neighbors(input)
+            .into_iter()
+            .filter(|(mid, _)| *mid != *input && *mid != *output && !hubs.contains(mid))
+            .take(MAX_NEIGHBOR_CANDIDATES / 4)
+            .collect();
+
+        // Collect neighbors of output that connect to any hub.
+        let out_neighbors: Vec<(Pubkey, String)> = self
+            .index
+            .neighbors(output)
+            .into_iter()
+            .filter(|(mid, _)| *mid != *input && *mid != *output && !hubs.contains(mid))
+            .take(MAX_NEIGHBOR_CANDIDATES / 4)
+            .collect();
+
+        for hub in hubs {
+            for (n_in, _) in &in_neighbors {
+                // Check n_in connects to hub
+                if self.index.direct_pools(n_in, hub).is_empty() {
+                    continue;
+                }
+                for (n_out, _) in &out_neighbors {
+                    if n_in == n_out {
+                        continue;
+                    }
+                    // Check hub connects to n_out
+                    if self.index.direct_pools(hub, n_out).is_empty() {
+                        continue;
+                    }
+
+                    // input → n_in → hub → n_out → output
+                    let l1 = self.index.direct_pools(input, n_in);
+                    let l2 = self.index.direct_pools(n_in, hub);
+                    let l3 = self.index.direct_pools(hub, n_out);
+                    let l4 = self.index.direct_pools(n_out, output);
+
+                    if l1.is_empty() || l2.is_empty() || l3.is_empty() || l4.is_empty() {
+                        continue;
+                    }
+
+                    let Some((a1, amt1)) = best_pool(self.index, &l1, *input, amount_in)
+                    else {
+                        continue;
+                    };
+                    let Some((a2, amt2)) = best_pool(self.index, &l2, *n_in, amt1) else {
+                        continue;
+                    };
+                    let Some((a3, amt3)) = best_pool(self.index, &l3, *hub, amt2) else {
+                        continue;
+                    };
+                    let Some((a4, _)) = best_pool(self.index, &l4, *n_out, amt3) else {
+                        continue;
+                    };
+
+                    if let Some(route) = simulate_path(
+                        self.index,
+                        &[
+                            (a1, *input, *n_in),
+                            (a2, *n_in, *hub),
+                            (a3, *hub, *n_out),
+                            (a4, *n_out, *output),
+                        ],
+                        amount_in,
+                    ) {
+                        out.push(route);
+                    }
+                }
+            }
+        }
+    }
 }
 
 // =============================================================================
-// Free helpers
+// Simulation helpers
 // =============================================================================
 
 /// Simulate a single hop: determine direction from pool metadata, compute output.
@@ -312,7 +447,7 @@ fn simulate_hop(
     let entry = index.get_pool(pool_address)?;
     let meta = entry.market.metadata().ok()?;
 
-    // Skip pools with negligible liquidity — they produce unrealistic outputs.
+    // Skip pools with negligible liquidity.
     if let Ok(fin) = entry.market.financials() {
         if fin.quote_balance < MIN_VAULT_BALANCE && fin.base_balance < MIN_VAULT_BALANCE {
             return None;
@@ -324,7 +459,7 @@ fn simulate_hop(
     } else if input_mint == meta.base_mint {
         (SwapDirection::Sell, meta.quote_mint)
     } else {
-        return None; // input_mint not in this pool
+        return None;
     };
 
     let output_amount = entry.market.calculate_output(amount_in, direction).ok()?;
@@ -332,8 +467,7 @@ fn simulate_hop(
         return None;
     }
 
-    // Skip if output exceeds a reasonable multiple of input (anti-dust filter).
-    // A legitimate pool should not return more than 1000x the input value.
+    // Anti-dust: reject absurd output ratios.
     if output_amount > amount_in.saturating_mul(1_000_000) {
         return None;
     }
@@ -343,7 +477,6 @@ fn simulate_hop(
         .calculate_price_impact(amount_in, direction)
         .unwrap_or(0);
 
-    // Skip hops with extreme price impact — the pool is too thin.
     if price_impact_bps > MAX_HOP_IMPACT_BPS {
         return None;
     }
@@ -359,24 +492,22 @@ fn simulate_hop(
     })
 }
 
-/// Simulate a full multi-hop path, chaining outputs. Returns None if any hop fails.
-///
-/// Also enforces no-cycle invariant: a route must not visit the same mint twice.
+/// Simulate a full multi-hop path. Returns None if any hop fails or a cycle is detected.
 fn simulate_path(
     index: &PoolIndex,
-    hops: &[(String, Pubkey, Pubkey)], // (pool_address, input_mint, output_mint)
+    hops: &[(String, Pubkey, Pubkey)],
     initial_amount: u64,
 ) -> Option<Route> {
     if hops.is_empty() {
         return None;
     }
 
-    // Cycle detection: collect all mints that appear in the path.
+    // Cycle detection.
     let mut visited = HashSet::new();
-    visited.insert(hops[0].1); // initial input_mint
+    visited.insert(hops[0].1);
     for (_, _, out_mint) in hops {
         if !visited.insert(*out_mint) {
-            return None; // cycle detected
+            return None;
         }
     }
 
@@ -384,7 +515,7 @@ fn simulate_path(
     let mut current_amount = initial_amount;
     let mut total_impact: u64 = 0;
 
-    for (pool_address, input_mint, _output_mint) in hops {
+    for (pool_address, input_mint, _) in hops {
         let hop = simulate_hop(index, pool_address, *input_mint, current_amount)?;
         current_amount = hop.output_amount;
         total_impact = total_impact.saturating_add(hop.price_impact_bps);
@@ -404,8 +535,7 @@ fn simulate_path(
     })
 }
 
-/// Among `pool_addresses`, pick the one yielding the highest output for `input_mint` / `amount_in`.
-/// Returns `(best_pool_address, best_output_amount)`.
+/// Among `pool_addresses`, pick the one yielding the highest output.
 fn best_pool(
     index: &PoolIndex,
     pool_addresses: &[String],

@@ -9,14 +9,18 @@ Build a Jupiter-like DEX aggregator as a new workspace crate (`crates/aggregator
 New workspace member `crates/aggregator/` with both `lib.rs` (library API) and `main.rs` (CLI binary). Existing DEX crates remain untouched. The aggregator treats all pools uniformly via `Box<dyn Market>`.
 
 ```
-RPC getProgramAccounts --> deserialize per-DEX --> PoolIndex (token graph)
-                                                       |
-User query (A->B, amount) --> Router (BFS, max 3 hops) --> simulate all paths
-                                                       |
-                                                  best route
+Cache file (pools.cache)                  RPC getProgramAccounts
+     |                                         (disc + dataSize filters, no mint filter)
+     v                                         |
+Load from disk (6s)  -- OR --  Load from RPC (3-4 min) + save cache
+     |                                         |
+     +------- PoolIndex (token graph) ---------+
+                      |
+SOL/USD <-- on-chain CLMM sqrt_price
+                      |
+User query (A->B, amount) --> Router (BFS, 1-4 hops, bidirectional) --> simulate
                                                        |
                           TransactionBuilder --> VersionedTransaction (v0)
-```
 
 ## File Structure
 
@@ -26,12 +30,13 @@ crates/aggregator/
   src/
     lib.rs              Public API re-exports
     main.rs             CLI entry point (tokio async main)
-    types.rs            Route, RouteHop, Quote, PoolEntry
+    types.rs            Route, RouteHop, Quote, PoolEntry (+ cached_data)
     pool_index.rs       In-memory token graph (mint adjacency list + pool storage)
-    router.rs           Multi-hop route finding (BFS + simulation)
-    transaction.rs      Versioned transaction builder (v0 + ALT support)
-    price.rs            Token price oracle (SOL/USD via pool graph)
-    loader.rs           Async pool loading from RPC (all 6 DEXs)
+    loader.rs           Async pool loading from RPC (all 6 DEXs, no mint filter)
+    cache.rs            Disk cache: save/load pools as bincode binary
+    router.rs           Multi-hop route finding (BFS, 1-4 hops, bidirectional)
+    transaction.rs      Versioned transaction builder (v0)
+    price.rs            SOL/USD on-chain via CLMM sqrt_price, per-token via pools
     stats.rs            Pool and system resource statistics
     cli.rs              Interactive CLI loop with progress bars
 ```
@@ -42,6 +47,7 @@ crates/aggregator/
 pub struct PoolEntry {
     pub market: Box<dyn Market>,
     pub dex_name: String,
+    pub cached_data: Vec<u8>,  // bincode of CachedPool for disk cache
 }
 
 pub struct RouteHop {
@@ -75,7 +81,7 @@ Adjacency list graph: `HashMap<Pubkey, Vec<(Pubkey, String)>>` maps each mint to
 
 ## Router
 
-BFS with depth limit (max 3 hops). Hub-first strategy: for 2+ hop routes, tries WSOL/USDC/USDT as intermediaries before full graph scan. For each candidate path, simulates the full swap chain via `calculate_output` to get actual output amount. Returns routes sorted by output amount descending.
+BFS with depth limit (1-4 hops). Bidirectional search: explores neighbors of BOTH input and output mints. Hub-first strategy for 2-hop (WSOL/USDC/USDT/JITOSOL/MSOL). 3-hop via neighbor+hub. 4-hop via input_neighbor->hub->output_neighbor. For each candidate path, simulates the full swap chain via `calculate_output` to get actual output amount. Returns routes sorted by output amount descending.
 
 ## Transaction Builder
 
@@ -87,15 +93,11 @@ BFS with depth limit (max 3 hops). Hub-first strategy: for 2+ hop routes, tries 
 
 ## Pool Loading
 
-Parallel `getProgramAccounts` calls per DEX with appropriate filters:
-- Raydium V4: dataSize=752
-- Raydium CLMM: dataSize=1544
-- Meteora DAMM V1: dataSize=944 + dataSize=952 (two calls)
-- Meteora DAMM V2: dataSize=1112
-- Meteora DLMM: dataSize=904
-- Pumpfun AMM: discriminator-based filter
+Fetches ALL pools from all 6 DEXs using `getProgramAccounts` with discriminator + dataSize filters only (no mint filter). Every pool across every token pair is loaded (~2M pools). Vault balances fetched via `getMultipleAccounts` in batches of 100, 20 concurrent. Two-phase fallback if full fetch fails: discover addresses with dataSlice, then batch-fetch full data.
 
-After fetching pool accounts, batch-fetch vault balances via `getMultipleAccounts` (100 accounts per batch). Progress reported per DEX via callback.
+## Pool Cache
+
+Pools saved to `pools.cache` (~1.6 GB) after first load. Subsequent startups load from cache in ~6s vs ~4min from RPC. Format: length-prefixed bincode-serialized CachedPool entries with a version header. Cache age checked on startup; stale caches trigger RPC reload.
 
 ## Price Oracle
 
@@ -131,15 +133,15 @@ borsh = { workspace = true }
 
 # Async + RPC
 tokio = { version = "1", features = ["full"] }
+futures = "0.3"
 solana-rpc-client = "3.0"
 solana-rpc-client-api = "3.0"
 solana-account-decoder-client-types = "3.0"
 solana-commitment-config = "3.0"
 
-# CLI
+# CLI + serialization + stats
 indicatif = "0.17"
 rustyline = "15"
-
-# Stats
 sysinfo = "0.34"
+bincode = "1.3"
 ```

@@ -6,3 +6,4 @@ pub mod price;
 pub mod stats;
 pub mod loader;
 pub mod cli;
+pub mod cache;
