@@ -2,7 +2,7 @@
 //!
 //! Derives SOL and USD prices by finding the highest-liquidity direct pool
 //! for each pair. Falls back to Jupiter Price API for SOL/USD when no
-//! on-chain USDC/WSOL pool is loaded.
+//! on-chain USDC/WSOL pool qualifies.
 
 use solana_pubkey::Pubkey;
 use thunder_core::{GenericError, USDC, WSOL};
@@ -10,21 +10,29 @@ use thunder_core::{GenericError, USDC, WSOL};
 use crate::pool_index::PoolIndex;
 use crate::types::TokenPrice;
 
+/// Minimum combined vault balance for a pool to be used in pricing.
+/// Set high enough to exclude dust pools that produce unreliable prices.
+const MIN_PRICING_LIQUIDITY: u64 = 10_000_000_000; // ~10 SOL equivalent
+
 /// Get the price of a token in SOL and USD.
 ///
-/// - If `mint` is WSOL, `price_sol` is `None` (it *is* SOL).
-/// - USD price prefers a direct USDC pool for `mint`; otherwise derives it
-///   via `price_sol * sol_usd_price`.
-pub fn get_token_price(index: &PoolIndex, mint: &Pubkey) -> Result<TokenPrice, GenericError> {
+/// `sol_usd_override` lets the caller inject a known SOL/USD price
+/// (e.g., from Jupiter API) so the sync function doesn't need async.
+pub fn get_token_price(
+    index: &PoolIndex,
+    mint: &Pubkey,
+    sol_usd_override: Option<f64>,
+) -> Result<TokenPrice, GenericError> {
     let wsol = Pubkey::from_str_const(WSOL);
     let usdc = Pubkey::from_str_const(USDC);
 
+    let sol_usd = sol_usd_override.or_else(|| get_sol_usd_price(index));
+
     if *mint == wsol {
-        let usd_price = get_sol_usd_price(index);
         return Ok(TokenPrice {
             mint: *mint,
             price_sol: None,
-            price_usd: usd_price,
+            price_usd: sol_usd,
         });
     }
 
@@ -34,7 +42,7 @@ pub fn get_token_price(index: &PoolIndex, mint: &Pubkey) -> Result<TokenPrice, G
     let price_usd = if let Some(direct_usd) = best_pool_price(index, mint, &usdc) {
         Some(direct_usd)
     } else if let Some(sol_price) = &price_sol {
-        get_sol_usd_price(index).map(|usd| sol_price * usd)
+        sol_usd.map(|usd| sol_price * usd)
     } else {
         None
     };
@@ -47,7 +55,7 @@ pub fn get_token_price(index: &PoolIndex, mint: &Pubkey) -> Result<TokenPrice, G
 }
 
 /// SOL price in USD from the highest-liquidity USDC/WSOL pool.
-fn get_sol_usd_price(index: &PoolIndex) -> Option<f64> {
+pub fn get_sol_usd_price(index: &PoolIndex) -> Option<f64> {
     let wsol = Pubkey::from_str_const(WSOL);
     let usdc = Pubkey::from_str_const(USDC);
 
@@ -56,19 +64,23 @@ fn get_sol_usd_price(index: &PoolIndex) -> Option<f64> {
     let mut best_liquidity = 0u64;
 
     for addr in pool_addrs {
-        let pool = index.get_pool(&addr)?;
-        let fin = pool.market.financials().ok()?;
-        let liquidity = fin.quote_balance;
-        if liquidity <= best_liquidity {
+        let Some(pool) = index.get_pool(&addr) else { continue };
+        let Ok(fin) = pool.market.financials() else { continue };
+        let liquidity = fin.quote_balance.saturating_add(fin.base_balance);
+        if liquidity < MIN_PRICING_LIQUIDITY || liquidity <= best_liquidity {
             continue;
         }
-        let meta = pool.market.metadata().ok()?;
-        let raw_price = pool.market.current_price().ok()?;
+        let Ok(meta) = pool.market.metadata() else { continue };
+        let Ok(raw_price) = pool.market.current_price() else { continue };
 
         // current_price() returns quote_per_base.
         // If quote=USDC, base=WSOL → price is already USD/SOL.
         // If quote=WSOL, base=USDC → invert to get USD/SOL.
         let price = if meta.quote_mint == usdc { raw_price } else { 1.0 / raw_price };
+
+        if !price.is_finite() || price <= 0.0 {
+            continue;
+        }
 
         best_price = Some(price);
         best_liquidity = liquidity;
@@ -85,19 +97,23 @@ fn best_pool_price(index: &PoolIndex, mint_a: &Pubkey, mint_b: &Pubkey) -> Optio
     let mut best_liquidity = 0u64;
 
     for addr in pool_addrs {
-        let pool = index.get_pool(&addr)?;
-        let fin = pool.market.financials().ok()?;
+        let Some(pool) = index.get_pool(&addr) else { continue };
+        let Ok(fin) = pool.market.financials() else { continue };
         let liquidity = fin.quote_balance.saturating_add(fin.base_balance);
-        if liquidity <= best_liquidity {
+        if liquidity < MIN_PRICING_LIQUIDITY || liquidity <= best_liquidity {
             continue;
         }
-        let meta = pool.market.metadata().ok()?;
-        let raw_price = pool.market.current_price().ok()?;
+        let Ok(meta) = pool.market.metadata() else { continue };
+        let Ok(raw_price) = pool.market.current_price() else { continue };
 
         // current_price() = quote_per_base.
         // If base=mint_a → price is already mint_b/mint_a.
         // If base=mint_b → invert to get mint_b/mint_a.
         let adjusted = if meta.base_mint == *mint_a { raw_price } else { 1.0 / raw_price };
+
+        if !adjusted.is_finite() || adjusted <= 0.0 {
+            continue;
+        }
 
         best_price = Some(adjusted);
         best_liquidity = liquidity;
@@ -106,12 +122,44 @@ fn best_pool_price(index: &PoolIndex, mint_a: &Pubkey, mint_b: &Pubkey) -> Optio
     best_price
 }
 
-/// Fetch SOL/USD price from Jupiter Price API v2 (async fallback).
+/// Fetch SOL/USD price from CoinGecko free API.
 pub async fn fetch_sol_usd_price_api() -> Option<f64> {
-    let url = "https://api.jup.ag/price/v2?ids=So11111111111111111111111111111111111111112";
-    let resp = reqwest::get(url).await.ok()?;
-    let json: serde_json::Value = resp.json().await.ok()?;
-    json["data"]["So11111111111111111111111111111111111111112"]["price"]
-        .as_str()
-        .and_then(|s| s.parse::<f64>().ok())
+    let url = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd";
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .user_agent("thunder-aggregator/0.1.0")
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Price API client build failed: {e}");
+            return None;
+        }
+    };
+    let resp = match client.get(url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Price API request failed: {e}");
+            return None;
+        }
+    };
+    let text = match resp.text().await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("Price API read body failed: {e}");
+            return None;
+        }
+    };
+    let json: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("Price API parse failed: {e}, body: {}", &text[..text.len().min(200)]);
+            return None;
+        }
+    };
+    let price = json["solana"]["usd"].as_f64();
+    if price.is_none() {
+        eprintln!("Price API: 'solana.usd' not found in response: {}", &text[..text.len().min(200)]);
+    }
+    price
 }

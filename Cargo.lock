@@ -4707,6 +4707,7 @@ name = "thunder-aggregator"
 version = "0.1.0"
 dependencies = [
  "borsh",
+ "futures",
  "indicatif 0.17.11",
  "meteora-damm",
  "meteora-dlmm",

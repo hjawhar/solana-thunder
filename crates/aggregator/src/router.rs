@@ -20,6 +20,14 @@ const HUB_MINTS_3HOP: [&str; 3] = [WSOL, USDC, USDT];
 /// Max intermediate mints explored for neighbor-based 2-hop search.
 const MAX_INTERMEDIATE_CANDIDATES: usize = 50;
 
+/// Minimum vault balance (raw units) for a pool to be routable.
+/// Pools with both vaults below this are skipped as dust.
+const MIN_VAULT_BALANCE: u64 = 10_000_000; // 0.01 SOL / 10 USDC
+
+/// Maximum acceptable price impact (bps) for a single hop.
+/// Routes through pools with higher impact are discarded.
+const MAX_HOP_IMPACT_BPS: u64 = 5000; // 50%
+
 pub struct Router<'a> {
     index: &'a PoolIndex,
     max_hops: usize,
@@ -304,6 +312,13 @@ fn simulate_hop(
     let entry = index.get_pool(pool_address)?;
     let meta = entry.market.metadata().ok()?;
 
+    // Skip pools with negligible liquidity — they produce unrealistic outputs.
+    if let Ok(fin) = entry.market.financials() {
+        if fin.quote_balance < MIN_VAULT_BALANCE && fin.base_balance < MIN_VAULT_BALANCE {
+            return None;
+        }
+    }
+
     let (direction, output_mint) = if input_mint == meta.quote_mint {
         (SwapDirection::Buy, meta.base_mint)
     } else if input_mint == meta.base_mint {
@@ -317,10 +332,21 @@ fn simulate_hop(
         return None;
     }
 
+    // Skip if output exceeds a reasonable multiple of input (anti-dust filter).
+    // A legitimate pool should not return more than 1000x the input value.
+    if output_amount > amount_in.saturating_mul(1_000_000) {
+        return None;
+    }
+
     let price_impact_bps = entry
         .market
         .calculate_price_impact(amount_in, direction)
         .unwrap_or(0);
+
+    // Skip hops with extreme price impact — the pool is too thin.
+    if price_impact_bps > MAX_HOP_IMPACT_BPS {
+        return None;
+    }
 
     Some(RouteHop {
         pool_address: pool_address.to_string(),

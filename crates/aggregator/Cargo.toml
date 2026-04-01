@@ -26,6 +26,7 @@ spl-token = { workspace = true }
 
 # Async + RPC
 tokio = { version = "1", features = ["full"] }
+futures = "0.3"
 solana-rpc-client = "3.0"
 solana-rpc-client-api = "3.0"
 solana-account-decoder-client-types = "3.0"

@@ -1,6 +1,6 @@
 use std::env;
 
-use thunder_aggregator::{cli, loader, stats};
+use thunder_aggregator::{cli, loader, price, stats};
 
 #[tokio::main]
 async fn main() {
@@ -31,7 +31,24 @@ async fn main() {
         index.unique_mints()
     );
 
+    // Fetch SOL/USD price from Jupiter API (more reliable than pool-derived).
+    let sol_usd_price = match price::fetch_sol_usd_price_api().await {
+        Some(p) => {
+            println!("SOL/USD: ${p:.2} (Jupiter API)\n");
+            Some(p)
+        }
+        None => {
+            let p = price::get_sol_usd_price(&index);
+            if let Some(p) = p {
+                println!("SOL/USD: ${p:.2} (pool-derived)\n");
+            } else {
+                println!("Warning: Could not determine SOL/USD price\n");
+            }
+            p
+        }
+    };
+
     // Interactive command loop.
     let mut stats_collector = stats::StatsCollector::new();
-    cli::run_repl(&index, &mut stats_collector).await;
+    cli::run_repl(&index, &mut stats_collector, sol_usd_price).await;
 }

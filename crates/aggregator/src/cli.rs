@@ -14,7 +14,7 @@ use crate::price::get_token_price;
 use crate::router::Router;
 use crate::stats::StatsCollector;
 use crate::types::{LoadPhase, LoadProgress};
-use thunder_core::WSOL;
+use thunder_core::{infer_mint_decimals, WSOL};
 
 // ---------------------------------------------------------------------------
 // Loading progress display
@@ -92,7 +92,7 @@ impl LoadingDisplay {
 // Interactive REPL
 // ---------------------------------------------------------------------------
 
-pub async fn run_repl(index: &PoolIndex, stats: &mut StatsCollector) {
+pub async fn run_repl(index: &PoolIndex, stats: &mut StatsCollector, sol_usd_price: Option<f64>) {
     println!("\nThunder Aggregator ready. Type 'help' for commands.\n");
 
     let mut rl = DefaultEditor::new().expect("Failed to create editor");
@@ -110,7 +110,7 @@ pub async fn run_repl(index: &PoolIndex, stats: &mut StatsCollector) {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 match parts[0] {
                     "help" => print_help(),
-                    "price" => cmd_price(index, &parts),
+                    "price" => cmd_price(index, &parts, sol_usd_price),
                     "route" | "quote" => cmd_route(index, &parts),
                     "stats" => cmd_stats(index, stats),
                     "exit" | "quit" => break,
@@ -140,7 +140,7 @@ fn parse_mint(s: &str) -> Option<Pubkey> {
     Pubkey::from_str(s).ok()
 }
 
-fn cmd_price(index: &PoolIndex, parts: &[&str]) {
+fn cmd_price(index: &PoolIndex, parts: &[&str], sol_usd: Option<f64>) {
     if parts.len() < 2 {
         println!("Usage: price <mint_address>");
         return;
@@ -154,7 +154,7 @@ fn cmd_price(index: &PoolIndex, parts: &[&str]) {
         }
     };
 
-    match get_token_price(index, &mint) {
+    match get_token_price(index, &mint, sol_usd) {
         Ok(tp) => {
             let mut has_price = false;
             if let Some(sol) = tp.price_sol {
@@ -195,11 +195,24 @@ fn cmd_route(index: &PoolIndex, parts: &[&str]) {
         }
     };
 
-    let amount: u64 = match parts[3].parse() {
-        Ok(a) => a,
-        Err(_) => {
-            println!("Invalid amount: {}", parts[3]);
-            return;
+    let amount: u64 = if parts[3].contains('.') {
+        match parts[3].parse::<f64>() {
+            Ok(human) => {
+                let decimals = infer_mint_decimals(&from_mint);
+                (human * 10f64.powi(decimals as i32)) as u64
+            }
+            Err(_) => {
+                println!("Invalid amount: {}", parts[3]);
+                return;
+            }
+        }
+    } else {
+        match parts[3].parse() {
+            Ok(a) => a,
+            Err(_) => {
+                println!("Invalid amount: {}", parts[3]);
+                return;
+            }
         }
     };
 
@@ -218,23 +231,22 @@ fn cmd_route(index: &PoolIndex, parts: &[&str]) {
                     route.hops.len()
                 );
                 for (j, hop) in route.hops.iter().enumerate() {
-                    let in_short = &hop.input_mint.to_string()[..8];
-                    let out_short = &hop.output_mint.to_string()[..8];
                     println!(
-                        "    Hop {}: {} -> {} via {} ({}) | {} -> {} | impact: {}bps",
+                        "    Hop {}: {} -> {} via {} ({}) | {} -> {} | impact: {:.2}%",
                         j + 1,
-                        in_short,
-                        out_short,
-                        &hop.pool_address[..8],
+                        trunc(&hop.input_mint.to_string()),
+                        trunc(&hop.output_mint.to_string()),
+                        trunc(&hop.pool_address),
                         hop.dex_name,
-                        hop.input_amount,
-                        hop.output_amount,
-                        hop.price_impact_bps,
+                        fmt_amount(hop.input_amount, &hop.input_mint),
+                        fmt_amount(hop.output_amount, &hop.output_mint),
+                        hop.price_impact_bps as f64 / 100.0,
                     );
                 }
                 println!(
-                    "    Output: {} | Total impact: {}bps",
-                    route.output_amount, route.price_impact_bps
+                    "    Output: {} | Total impact: {:.2}%",
+                    fmt_amount(route.output_amount, &route.output_mint),
+                    route.price_impact_bps as f64 / 100.0,
                 );
                 if i == 0 {
                     println!("    ^ Best route");
@@ -257,4 +269,30 @@ fn cmd_stats(index: &PoolIndex, stats: &mut StatsCollector) {
     println!("  Memory: {:.1} MB", s.memory_mb);
     println!("  CPU: {:.1}%", s.cpu_percent);
     println!("  Uptime: {}s", s.uptime_secs);
+}
+
+
+/// Format a raw token amount as human-readable using inferred decimals.
+fn fmt_amount(raw: u64, mint: &Pubkey) -> String {
+    let decimals = infer_mint_decimals(mint);
+    let divisor = 10f64.powi(decimals as i32);
+    let human = raw as f64 / divisor;
+    if human >= 1_000_000.0 {
+        format!("{:.2}M", human / 1_000_000.0)
+    } else if human >= 1_000.0 {
+        format!("{:.2}K", human / 1_000.0)
+    } else if human >= 1.0 {
+        format!("{:.4}", human)
+    } else {
+        format!("{:.8}", human)
+    }
+}
+
+/// Truncate a pubkey or address string for display.
+fn trunc(s: &str) -> String {
+    if s.len() > 12 {
+        format!("{}..{}", &s[..6], &s[s.len()-4..])
+    } else {
+        s.to_string()
+    }
 }

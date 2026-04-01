@@ -160,6 +160,12 @@ impl RaydiumClmmMarket {
         if self.flipped { human_price } else { 1.0 / human_price }
     }
 
+    /// Raw price: token_1_raw per token_0_raw (no decimal adjustment, no flip).
+    fn raw_price_token1_per_token0(&self) -> f64 {
+        let sqrt = self.pool.sqrt_price_x64 as f64 / (1u128 << 64) as f64;
+        sqrt * sqrt
+    }
+
     /// Calculate output for CLMM swap.
     ///
     /// Note: This is a simplified calculation. Real CLMM swaps traverse multiple ticks.
@@ -180,37 +186,29 @@ impl RaydiumClmmMarket {
             direction
         };
 
-        let price = self.sqrt_price_to_price();
+        let raw_price = self.raw_price_token1_per_token0();
+        // raw_price = token_1_raw per token_0_raw
 
-        // Simple estimation based on current tick liquidity.
-        // In reality, CLMM swaps can traverse multiple ticks.
-        let liquidity = self.pool.liquidity;
-
-        if liquidity == 0 {
+        if self.pool.liquidity == 0 {
             return Err("Pool has zero liquidity".into());
         }
 
-        // Calculate fee (from total fees, estimate ~0.25% = 25 bps)
-        let fee_bps = 25u64; // Raydium CLMM typically uses 0.25% fee
+        let fee_bps = 25u64;
         let fee_multiplier = 10000 - fee_bps;
         let amount_in_with_fee = (amount_in as u128 * fee_multiplier as u128) / 10000;
 
-        // Simplified output calculation using current price
-        // Note: physical_direction uses the raw pool orientation (not flipped).
-        // sqrt_price_to_price already accounts for flipped, so we use the
-        // normalized price here with the physical direction.
+        // physical_direction is in the pool's raw token ordering.
+        // Buy physically: token_0 -> token_1, output = input * raw_price
+        // Sell physically: token_1 -> token_0, output = input / raw_price
         let output = match physical_direction {
             SwapDirection::Buy => {
-                // Quote -> Base (token_0 -> token_1)
-                let decimal_adjustment = 10u64.pow(self.pool.mint_decimals_1 as u32) as f64
-                    / 10u64.pow(self.pool.mint_decimals_0 as u32) as f64;
-                (amount_in_with_fee as f64 * price * decimal_adjustment) as u64
+                (amount_in_with_fee as f64 * raw_price) as u64
             }
             SwapDirection::Sell => {
-                // Base -> Quote (token_1 -> token_0)
-                let decimal_adjustment = 10u64.pow(self.pool.mint_decimals_0 as u32) as f64
-                    / 10u64.pow(self.pool.mint_decimals_1 as u32) as f64;
-                (amount_in_with_fee as f64 / price * decimal_adjustment) as u64
+                if raw_price == 0.0 {
+                    return Err("Zero price".into());
+                }
+                (amount_in_with_fee as f64 / raw_price) as u64
             }
         };
 

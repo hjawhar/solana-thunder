@@ -177,7 +177,11 @@ impl MeteoraDlmmMarket {
         amount_in: u64,
         direction: SwapDirection,
     ) -> Result<u64, GenericError> {
-        let price = self.current_price()?;
+        // Use raw bin price (no decimal adjustment) since amount_in/output are raw token units.
+        let bin_step = self.pool.bin_step as f64;
+        let active_id = self.pool.active_id;
+        let base = 1.0 + (bin_step / 10000.0);
+        let price = base.powi(active_id);
 
         // Fee = base_factor * bin_step / 10_000 (in bps).
         let fee_bps = (self.pool.parameters.base_factor as u64 * self.pool.bin_step as u64) / 10_000;
