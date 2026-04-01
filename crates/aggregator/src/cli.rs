@@ -60,12 +60,12 @@ impl LoadingDisplay {
             match &progress.phase {
                 LoadPhase::FetchingPools => {
                     pb.set_message("Fetching pools...");
-                    pb.enable_steady_tick(Duration::from_millis(100));
+                    pb.enable_steady_tick(Duration::from_millis(120));
                 }
                 LoadPhase::Deserializing { done, total } => {
                     pb.set_length(*total as u64);
                     pb.set_position(*done as u64);
-                    pb.set_message("Deserializing...");
+                    pb.set_message(format!("{total} pools discovered"));
                 }
                 LoadPhase::FetchingBalances { done, total } => {
                     pb.set_length(*total as u64);
@@ -78,6 +78,8 @@ impl LoadingDisplay {
                     pb.set_message("Building markets...");
                 }
                 LoadPhase::Complete { pool_count } => {
+                    pb.set_length(*pool_count as u64);
+                    pb.set_position(*pool_count as u64);
                     pb.finish_with_message(format!("{pool_count} pools loaded"));
                 }
                 LoadPhase::Error(msg) => {
