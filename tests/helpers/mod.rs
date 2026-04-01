@@ -130,3 +130,38 @@ pub fn bs58_encode(data: &[u8]) -> String {
     }
     result
 }
+
+
+/// Build a Geyser client. Optionally request a snapshot of current state.
+pub async fn geyser_client(snapshot: bool) -> GeyserGrpcClient<impl yellowstone_grpc_client::Interceptor + Clone> {
+    init_tls();
+    let endpoint = std::env::var("GEYSER_ENDPOINT").expect("GEYSER_ENDPOINT not set");
+    let token = std::env::var("GEYSER_TOKEN").ok();
+
+    let builder = GeyserGrpcClient::build_from_shared(endpoint.clone())
+        .expect("invalid endpoint")
+        .x_token(token)
+        .expect("invalid token")
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(60))
+        .max_decoding_message_size(64 * 1024 * 1024)
+        .set_x_request_snapshot(snapshot);
+
+    let builder = if endpoint.starts_with("https") {
+        builder
+            .tls_config(ClientTlsConfig::new().with_native_roots())
+            .expect("tls config failed")
+    } else {
+        builder
+    };
+
+    builder.connect().await.expect("connection failed")
+}
+
+/// Read u64 token balance from raw SPL token account data (bytes 64..72).
+pub fn read_token_balance(data: &[u8]) -> u64 {
+    if data.len() < 72 {
+        return 0;
+    }
+    u64::from_le_bytes(data[64..72].try_into().unwrap())
+}

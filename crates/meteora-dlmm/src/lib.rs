@@ -9,9 +9,9 @@ use solana_pubkey::Pubkey;
 use solana_sdk::instruction::{AccountMeta, Instruction};
 
 use thunder_core::{
-    calculate_price_impact_bps, ConcentratedLiquidity, GenericError, Market, PoolFees,
-    PoolFinancials, PoolMetadata, RequiredAccounts, SwapArgs, SwapContext, SwapDirection,
-    MEMO_PROGRAM_V2, TOKEN_PROGRAM, WSOL,
+    calculate_price_impact_bps, quote_priority, ConcentratedLiquidity, GenericError, Market,
+    PoolFees, PoolFinancials, PoolMetadata, RequiredAccounts, SwapArgs, SwapContext,
+    SwapDirection, MEMO_PROGRAM_V2, TOKEN_PROGRAM, WSOL, infer_mint_decimals,
 };
 
 // ---------------------------------------------------------------------------
@@ -147,15 +147,24 @@ pub struct MeteoraDlmmMarket {
     pub pool_address: String,
     pub reserve_x_balance: u64,
     pub reserve_y_balance: u64,
+    pub token_x_decimals: u8,
+    pub token_y_decimals: u8,
+    pub flipped: bool,
 }
 
 impl MeteoraDlmmMarket {
     pub fn new(pool: MeteoraDLMMPool, pool_address: String) -> Self {
+        let flipped = quote_priority(&pool.token_x_mint).unwrap_or(usize::MAX) < quote_priority(&pool.token_y_mint).unwrap_or(usize::MAX);
+        let token_x_decimals = infer_mint_decimals(&pool.token_x_mint);
+        let token_y_decimals = infer_mint_decimals(&pool.token_y_mint);
         Self {
             pool,
             pool_address,
             reserve_x_balance: 0,
             reserve_y_balance: 0,
+            token_x_decimals,
+            token_y_decimals,
+            flipped,
         }
     }
 
@@ -170,14 +179,24 @@ impl MeteoraDlmmMarket {
     ) -> Result<u64, GenericError> {
         let price = self.current_price()?;
 
-        // DLMM uses dynamic fees based on volatility; clamp base factor to sane range.
-        let base_fee = self.pool.parameters.base_factor as u64;
-        let fee_bps = base_fee.max(10).min(200); // 0.1% – 2%
+        // Fee = base_factor * bin_step / 10_000 (in bps).
+        let fee_bps = (self.pool.parameters.base_factor as u64 * self.pool.bin_step as u64) / 10_000;
 
         let fee_multiplier = 10000 - fee_bps;
         let amount_in_with_fee = (amount_in as u128 * fee_multiplier as u128) / 10000;
 
-        let output = match direction {
+        // After normalization, Buy = spend quote to get base, Sell = spend base to get quote.
+        // Flip the physical direction when the pool sides are swapped.
+        let effective_direction = if self.flipped {
+            match direction {
+                SwapDirection::Buy => SwapDirection::Sell,
+                SwapDirection::Sell => SwapDirection::Buy,
+            }
+        } else {
+            direction
+        };
+
+        let output = match effective_direction {
             SwapDirection::Buy => {
                 // Y → X (SOL → Token): output ≈ amount_in / price
                 (amount_in_with_fee as f64 / price) as u64
@@ -191,12 +210,15 @@ impl MeteoraDlmmMarket {
         Ok(output)
     }
 
-    /// Bin price from active_id: price = (1 + bin_step / 10000)^active_id
+    /// Bin price: (1 + bin_step / 10000)^active_id * 10^(dec_x - dec_y)
+    /// Result = token_y per token_x (human-readable).
+    /// E.g. for SOL/USDC: returns ~82 (USDC per SOL).
     fn calculate_dlmm_price(&self) -> f64 {
         let bin_step = self.pool.bin_step as f64;
         let active_id = self.pool.active_id;
         let base = 1.0 + (bin_step / 10000.0);
-        base.powi(active_id)
+        let raw = base.powi(active_id);
+        raw * 10f64.powi(self.token_x_decimals as i32 - self.token_y_decimals as i32)
     }
 }
 
@@ -206,15 +228,22 @@ impl MeteoraDlmmMarket {
 
 impl Market for MeteoraDlmmMarket {
     fn metadata(&self) -> Result<PoolMetadata, GenericError> {
-        let trade_fee_bps = self.pool.parameters.base_factor as u64;
+        // Fee = base_factor * bin_step / 10_000 (in bps).
+        let trade_fee_bps = (self.pool.parameters.base_factor as u64 * self.pool.bin_step as u64) / 10_000;
+
+        let (quote_mint, base_mint, quote_vault, base_vault) = if self.flipped {
+            (self.pool.token_x_mint, self.pool.token_y_mint, self.pool.reserve_x, self.pool.reserve_y)
+        } else {
+            (self.pool.token_y_mint, self.pool.token_x_mint, self.pool.reserve_y, self.pool.reserve_x)
+        };
 
         Ok(PoolMetadata {
             address: self.pool_address.clone(),
             dex_name: "Meteora DLMM".to_string(),
-            quote_mint: self.pool.token_y_mint,  // Y = quote (SOL)
-            base_mint: self.pool.token_x_mint,   // X = base (token)
-            quote_vault: self.pool.reserve_y,
-            base_vault: self.pool.reserve_x,
+            quote_mint,
+            base_mint,
+            quote_vault,
+            base_vault,
             fees: PoolFees {
                 trade_fee_bps,
                 protocol_fee_bps: Some(self.pool.parameters.protocol_share as u64),
@@ -223,11 +252,16 @@ impl Market for MeteoraDlmmMarket {
     }
 
     fn financials(&self) -> Result<PoolFinancials, GenericError> {
+        let (quote_balance, base_balance, quote_decimals, base_decimals) = if self.flipped {
+            (self.reserve_x_balance, self.reserve_y_balance, self.token_x_decimals, self.token_y_decimals)
+        } else {
+            (self.reserve_y_balance, self.reserve_x_balance, self.token_y_decimals, self.token_x_decimals)
+        };
         Ok(PoolFinancials {
-            quote_balance: self.reserve_y_balance,
-            base_balance: self.reserve_x_balance,
-            quote_decimals: 9, // Assuming SOL (Y)
-            base_decimals: 6,  // Common token decimals (X)
+            quote_balance,
+            base_balance,
+            quote_decimals,
+            base_decimals,
         })
     }
 
@@ -247,7 +281,17 @@ impl Market for MeteoraDlmmMarket {
         let pre_swap_price = self.current_price()?;
         let output = self.calculate_output(amount_in, direction)?;
 
-        let post_swap_price = match direction {
+        // Use the effective (physical) direction for reserve math.
+        let effective_direction = if self.flipped {
+            match direction {
+                SwapDirection::Buy => SwapDirection::Sell,
+                SwapDirection::Sell => SwapDirection::Buy,
+            }
+        } else {
+            direction
+        };
+
+        let post_swap_price = match effective_direction {
             SwapDirection::Buy => {
                 let new_reserve_y = self.reserve_y_balance + amount_in;
                 let new_reserve_x = self.reserve_x_balance.saturating_sub(output);
@@ -270,7 +314,18 @@ impl Market for MeteoraDlmmMarket {
     }
 
     fn current_price(&self) -> Result<f64, GenericError> {
-        Ok(self.calculate_dlmm_price())
+        let price = self.calculate_dlmm_price();
+        // price = token_y per token_x (human-readable).
+        // NOT flipped (quote=y, base=x): price is already quote_per_base. Return as-is.
+        // Flipped (quote=x, base=y): want x_per_y = 1/price.
+        if self.flipped {
+            if price == 0.0 {
+                return Err("Pool has zero price".into());
+            }
+            Ok(1.0 / price)
+        } else {
+            Ok(price)
+        }
     }
 
     fn build_swap_instruction(
@@ -311,7 +366,18 @@ impl Market for MeteoraDlmmMarket {
             context.token_program_id
         };
 
-        match direction {
+        // When flipped, the Market's Buy (spend quote to get base) maps to the
+        // physical Sell direction (X→Y becomes Y→X) and vice versa.
+        let physical_direction = if self.flipped {
+            match direction {
+                SwapDirection::Buy => SwapDirection::Sell,
+                SwapDirection::Sell => SwapDirection::Buy,
+            }
+        } else {
+            direction
+        };
+
+        match physical_direction {
             SwapDirection::Buy => {
                 // Buy: Y (SOL) → X (Token)
 
@@ -488,8 +554,16 @@ impl Market for MeteoraDlmmMarket {
         direction: SwapDirection,
     ) -> Result<RequiredAccounts, GenericError> {
         let (source_mint, destination_mint) = match direction {
-            SwapDirection::Buy => (self.pool.token_y_mint, self.pool.token_x_mint),
-            SwapDirection::Sell => (self.pool.token_x_mint, self.pool.token_y_mint),
+            SwapDirection::Buy => if self.flipped {
+                (self.pool.token_x_mint, self.pool.token_y_mint)
+            } else {
+                (self.pool.token_y_mint, self.pool.token_x_mint)
+            },
+            SwapDirection::Sell => if self.flipped {
+                (self.pool.token_y_mint, self.pool.token_x_mint)
+            } else {
+                (self.pool.token_x_mint, self.pool.token_y_mint)
+            },
         };
 
         Ok(RequiredAccounts {

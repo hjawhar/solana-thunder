@@ -12,7 +12,7 @@ use solana_sdk::instruction::Instruction;
 use thunder_core::{
     ConcentratedLiquidity, GenericError, Market, PoolFees, PoolFinancials, PoolMetadata,
     RequiredAccounts, SwapArgs, SwapContext, SwapDirection, calculate_price_impact_bps,
-    MEMO_PROGRAM_V2, TOKEN_PROGRAM, TOKEN_PROGRAM_2022,
+    MEMO_PROGRAM_V2, TOKEN_PROGRAM, TOKEN_PROGRAM_2022, quote_priority,
 };
 
 use crate::tick_arrays::{compute_clmm_remaining_accounts, pda_array_bitmap_address};
@@ -123,25 +123,41 @@ pub struct RaydiumClmmMarket {
     /// Current vault balances (cached from last fetch)
     pub vault_0_balance: u64,
     pub vault_1_balance: u64,
+    /// If true, token_mint_1 is the quote currency and assignments are swapped.
+    pub flipped: bool,
 }
 
 impl RaydiumClmmMarket {
     pub fn new(pool: RaydiumCLMMPool, pool_address: String) -> Self {
+        let flipped = quote_priority(&pool.token_mint_1).unwrap_or(usize::MAX) < quote_priority(&pool.token_mint_0).unwrap_or(usize::MAX);
         Self {
             pool,
             pool_address,
             vault_0_balance: 0,
             vault_1_balance: 0,
+            flipped,
         }
     }
 
-    /// Convert sqrt_price_x64 to regular price.
+    /// Convert sqrt_price_x64 to a price in quote-per-base terms.
     ///
-    /// CLMM uses Q64.64 fixed-point format for sqrt(price):
-    /// price = (sqrt_price_x64 / 2^64)^2
+    /// CLMM sqrt_price_x64 encodes sqrt(token_1_per_token_0) in Q64.64.
+    /// raw = (sqrt_price / 2^64)^2 = token_1 per token_0 in raw units.
+    /// Decimal adjustment: raw * 10^(dec_1 - dec_0) gives human-readable token_1 per token_0.
+    ///
+    /// When flipped (token_1 = quote): human_price is quote/base, return as-is.
+    /// When NOT flipped (token_0 = quote): human_price is base/quote, return 1/human_price.
     fn sqrt_price_to_price(&self) -> f64 {
         let sqrt_price_f64 = self.pool.sqrt_price_x64 as f64 / (1u128 << 64) as f64;
-        sqrt_price_f64 * sqrt_price_f64
+        let raw = sqrt_price_f64 * sqrt_price_f64;
+        // raw = token_1_lamports per token_0_lamports
+        // human = raw * 10^(dec_0 - dec_1)
+        let decimal_adj = 10f64.powi(self.pool.mint_decimals_0 as i32 - self.pool.mint_decimals_1 as i32);
+        let human_price = raw * decimal_adj;
+        // human_price = token_1 per token_0 (human-readable)
+        // NOT flipped (token_0=quote): want quote_per_base = 1/human_price
+        // Flipped (token_1=quote): want quote_per_base = human_price
+        if self.flipped { human_price } else { 1.0 / human_price }
     }
 
     /// Calculate output for CLMM swap.
@@ -153,6 +169,17 @@ impl RaydiumClmmMarket {
         amount_in: u64,
         direction: SwapDirection,
     ) -> Result<u64, GenericError> {
+        // When flipped, a Market-level Buy (spend quote to get base) is physically
+        // a swap in the opposite direction through the pool, and vice versa.
+        let physical_direction = if self.flipped {
+            match direction {
+                SwapDirection::Buy => SwapDirection::Sell,
+                SwapDirection::Sell => SwapDirection::Buy,
+            }
+        } else {
+            direction
+        };
+
         let price = self.sqrt_price_to_price();
 
         // Simple estimation based on current tick liquidity.
@@ -169,7 +196,10 @@ impl RaydiumClmmMarket {
         let amount_in_with_fee = (amount_in as u128 * fee_multiplier as u128) / 10000;
 
         // Simplified output calculation using current price
-        let output = match direction {
+        // Note: physical_direction uses the raw pool orientation (not flipped).
+        // sqrt_price_to_price already accounts for flipped, so we use the
+        // normalized price here with the physical direction.
+        let output = match physical_direction {
             SwapDirection::Buy => {
                 // Quote -> Base (token_0 -> token_1)
                 let decimal_adjustment = 10u64.pow(self.pool.mint_decimals_1 as u32) as f64
@@ -197,13 +227,19 @@ impl Market for RaydiumClmmMarket {
         // CLMM fees are typically 0.25% (25 bps)
         let trade_fee_bps = 25u64;
 
+        let (quote_mint, base_mint, quote_vault, base_vault) = if self.flipped {
+            (self.pool.token_mint_1, self.pool.token_mint_0, self.pool.token_vault_1, self.pool.token_vault_0)
+        } else {
+            (self.pool.token_mint_0, self.pool.token_mint_1, self.pool.token_vault_0, self.pool.token_vault_1)
+        };
+
         Ok(PoolMetadata {
             address: self.pool_address.clone(),
             dex_name: "Raydium CLMM".to_string(),
-            quote_mint: self.pool.token_mint_0,
-            base_mint: self.pool.token_mint_1,
-            quote_vault: self.pool.token_vault_0,
-            base_vault: self.pool.token_vault_1,
+            quote_mint,
+            base_mint,
+            quote_vault,
+            base_vault,
             fees: PoolFees {
                 trade_fee_bps,
                 protocol_fee_bps: None,
@@ -212,11 +248,16 @@ impl Market for RaydiumClmmMarket {
     }
 
     fn financials(&self) -> Result<PoolFinancials, GenericError> {
+        let (quote_balance, base_balance, quote_decimals, base_decimals) = if self.flipped {
+            (self.vault_1_balance, self.vault_0_balance, self.pool.mint_decimals_1, self.pool.mint_decimals_0)
+        } else {
+            (self.vault_0_balance, self.vault_1_balance, self.pool.mint_decimals_0, self.pool.mint_decimals_1)
+        };
         Ok(PoolFinancials {
-            quote_balance: self.vault_0_balance,
-            base_balance: self.vault_1_balance,
-            quote_decimals: self.pool.mint_decimals_0,
-            base_decimals: self.pool.mint_decimals_1,
+            quote_balance,
+            base_balance,
+            quote_decimals,
+            base_decimals,
         })
     }
 
@@ -238,7 +279,17 @@ impl Market for RaydiumClmmMarket {
         // Calculate post-swap price (simplified - real CLMM would traverse ticks)
         let output = self.calculate_output(amount_in, direction)?;
 
-        let post_swap_price = match direction {
+        // Map Market direction to physical pool direction for price impact
+        let physical_direction = if self.flipped {
+            match direction {
+                SwapDirection::Buy => SwapDirection::Sell,
+                SwapDirection::Sell => SwapDirection::Buy,
+            }
+        } else {
+            direction
+        };
+
+        let post_swap_price = match physical_direction {
             SwapDirection::Buy => {
                 // After buying base with quote, price increases slightly
                 let new_vault_0 = self.vault_0_balance + amount_in;
@@ -263,14 +314,7 @@ impl Market for RaydiumClmmMarket {
     }
 
     fn current_price(&self) -> Result<f64, GenericError> {
-        // Use sqrt_price_x64 for accurate CLMM pricing
-        let price = self.sqrt_price_to_price();
-
-        // Adjust for decimals
-        let decimal_adjustment = 10u64.pow(self.pool.mint_decimals_0 as u32) as f64
-            / 10u64.pow(self.pool.mint_decimals_1 as u32) as f64;
-
-        Ok(price * decimal_adjustment)
+        Ok(self.sqrt_price_to_price())
     }
 
     fn build_swap_instruction(
@@ -307,7 +351,17 @@ impl Market for RaydiumClmmMarket {
             .extra_accounts
             .get(&tick_array_bitmap.to_string());
 
-        match direction {
+        // When flipped, a Market-level Buy physically swaps in the opposite direction
+        let physical_direction = if self.flipped {
+            match direction {
+                SwapDirection::Buy => SwapDirection::Sell,
+                SwapDirection::Sell => SwapDirection::Buy,
+            }
+        } else {
+            direction
+        };
+
+        match physical_direction {
             SwapDirection::Buy => {
                 // Buy: token_0 (SOL) -> token_1 (Token)
 
@@ -521,11 +575,14 @@ impl Market for RaydiumClmmMarket {
         _user: Pubkey,
         _direction: SwapDirection,
     ) -> Result<RequiredAccounts, GenericError> {
-        // Raydium CLMM: base_mint = Token, quote_mint = SOL (standard convention)
         // CLMM instruction builder uses destination_ata as the Token-side user account
         // for BOTH directions (SOL side always uses a temp WSOL account).
-        // So destination_mint must always be the Token (token_mint_1).
-        let (source_mint, destination_mint) = (self.pool.token_mint_0, self.pool.token_mint_1);
+        // When flipped, the "token" side is token_mint_0 instead of token_mint_1.
+        let (source_mint, destination_mint) = if self.flipped {
+            (self.pool.token_mint_1, self.pool.token_mint_0)
+        } else {
+            (self.pool.token_mint_0, self.pool.token_mint_1)
+        };
 
         // Fetch bitmap extension account — needed for tick arrays outside +-512 index range
         let pair = Pubkey::from_str_const(&self.pool_address);

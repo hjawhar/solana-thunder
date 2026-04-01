@@ -12,6 +12,7 @@ members = [
     "crates/meteora-damm",
     "crates/meteora-dlmm",
     "crates/pumpfun-amm",
+    "crates/aggregator",
 ]
 
 [dependencies]
@@ -33,6 +34,9 @@ yellowstone-grpc-proto = { version = "11.0", features = ["plugin"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
 solana-pubkey = { workspace = true }
+borsh = { workspace = true }
+reqwest = { version = "0.12", features = ["json"] }
+serde_json = "1.0"
 
 [workspace.dependencies]
 serde = { version = "1.0.228", features = ["derive"] }

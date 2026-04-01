@@ -12,6 +12,7 @@ use thunder_core::{
     GenericError, Market, SwapArgs, SwapDirection, PoolMetadata, PoolFinancials, PoolFees,
     SwapContext, RequiredAccounts,
     constant_product_swap, calculate_price_impact_bps,
+    quote_priority,
     WSOL, TOKEN_PROGRAM,
 };
 
@@ -105,6 +106,7 @@ pub struct RaydiumAmmV4Market {
     pub pool_address: String,
     pub quote_balance: u64,
     pub base_balance: u64,
+    pub flipped: bool,
 }
 
 impl RaydiumAmmV4Market {
@@ -114,7 +116,11 @@ impl RaydiumAmmV4Market {
         quote_balance: u64,
         base_balance: u64,
     ) -> Self {
-        Self { pool, pool_address, quote_balance, base_balance }
+        // Pool struct has explicit base_mint/quote_mint, but they can be swapped.
+        // If base_mint is a quote currency (WSOL/USDC) and quote_mint is not,
+        // the pool's labels are backwards relative to our convention.
+        let flipped = quote_priority(&pool.base_mint).unwrap_or(usize::MAX) < quote_priority(&pool.quote_mint).unwrap_or(usize::MAX);
+        Self { pool, pool_address, quote_balance, base_balance, flipped }
     }
 }
 
@@ -131,10 +137,10 @@ impl Market for RaydiumAmmV4Market {
         Ok(PoolMetadata {
             address: self.pool_address.clone(),
             dex_name: "Raydium AMM V4".to_string(),
-            quote_mint: self.pool.quote_mint,
-            base_mint: self.pool.base_mint,
-            quote_vault: self.pool.quote_vault,
-            base_vault: self.pool.base_vault,
+            quote_mint: if self.flipped { self.pool.base_mint } else { self.pool.quote_mint },
+            base_mint: if self.flipped { self.pool.quote_mint } else { self.pool.base_mint },
+            quote_vault: if self.flipped { self.pool.base_vault } else { self.pool.quote_vault },
+            base_vault: if self.flipped { self.pool.quote_vault } else { self.pool.base_vault },
             fees: PoolFees {
                 trade_fee_bps: fee_bps,
                 protocol_fee_bps: None,
@@ -144,10 +150,10 @@ impl Market for RaydiumAmmV4Market {
 
     fn financials(&self) -> Result<PoolFinancials, GenericError> {
         Ok(PoolFinancials {
-            quote_balance: self.quote_balance,
-            base_balance: self.base_balance,
-            quote_decimals: 9, // SOL decimals
-            base_decimals: self.pool.base_decimal as u8,
+            quote_balance: if self.flipped { self.base_balance } else { self.quote_balance },
+            base_balance: if self.flipped { self.quote_balance } else { self.base_balance },
+            quote_decimals: if self.flipped { self.pool.base_decimal as u8 } else { self.pool.quote_decimal as u8 },
+            base_decimals: if self.flipped { self.pool.quote_decimal as u8 } else { self.pool.base_decimal as u8 },
         })
     }
 
@@ -160,24 +166,22 @@ impl Market for RaydiumAmmV4Market {
             / self.pool.trade_fee_denominator as f64
             * 10000.0) as u64;
 
+        // When flipped, the pool's physical quote/base are swapped relative to
+        // our normalized convention, so we swap reserve_in/reserve_out.
+        let (quote_bal, base_bal) = if self.flipped {
+            (self.base_balance, self.quote_balance)
+        } else {
+            (self.quote_balance, self.base_balance)
+        };
+
         match direction {
             SwapDirection::Buy => {
-                // Quote -> Base (SOL -> Token)
-                constant_product_swap(
-                    self.quote_balance,
-                    self.base_balance,
-                    amount_in,
-                    fee_bps,
-                )
+                // Quote -> Base
+                constant_product_swap(quote_bal, base_bal, amount_in, fee_bps)
             }
             SwapDirection::Sell => {
-                // Base -> Quote (Token -> SOL)
-                constant_product_swap(
-                    self.base_balance,
-                    self.quote_balance,
-                    amount_in,
-                    fee_bps,
-                )
+                // Base -> Quote
+                constant_product_swap(base_bal, quote_bal, amount_in, fee_bps)
             }
         }
     }
@@ -190,15 +194,21 @@ impl Market for RaydiumAmmV4Market {
         let pre_swap_price = self.current_price()?;
         let output = self.calculate_output(amount_in, direction)?;
 
+        let (quote_bal, base_bal) = if self.flipped {
+            (self.base_balance, self.quote_balance)
+        } else {
+            (self.quote_balance, self.base_balance)
+        };
+
         let post_swap_price = match direction {
             SwapDirection::Buy => {
-                let new_quote = self.quote_balance + amount_in;
-                let new_base = self.base_balance - output;
+                let new_quote = quote_bal + amount_in;
+                let new_base = base_bal - output;
                 new_quote as f64 / new_base as f64
             }
             SwapDirection::Sell => {
-                let new_base = self.base_balance + amount_in;
-                let new_quote = self.quote_balance - output;
+                let new_base = base_bal + amount_in;
+                let new_quote = quote_bal - output;
                 new_quote as f64 / new_base as f64
             }
         };
@@ -207,10 +217,22 @@ impl Market for RaydiumAmmV4Market {
     }
 
     fn current_price(&self) -> Result<f64, GenericError> {
-        if self.base_balance == 0 {
+        let (quote_bal, base_bal) = if self.flipped {
+            (self.base_balance, self.quote_balance)
+        } else {
+            (self.quote_balance, self.base_balance)
+        };
+        if base_bal == 0 {
             return Err("Pool has zero base balance".into());
         }
-        Ok(self.quote_balance as f64 / self.base_balance as f64)
+        let (quote_dec, base_dec) = if self.flipped {
+            (self.pool.base_decimal, self.pool.quote_decimal)
+        } else {
+            (self.pool.quote_decimal, self.pool.base_decimal)
+        };
+        let quote_human = quote_bal as f64 / 10f64.powi(quote_dec as i32);
+        let base_human = base_bal as f64 / 10f64.powi(base_dec as i32);
+        Ok(quote_human / base_human)
     }
 
     fn build_swap_instruction(
@@ -229,7 +251,18 @@ impl Market for RaydiumAmmV4Market {
         let amm_authority = Pubkey::from_str_const(RAYDIUM_AUTHORITY_V4);
         let amm_id = Pubkey::from_str_const(&self.pool_address);
 
-        match direction {
+        // When flipped, a Market Buy (spend quote, get base) maps to the pool's
+        // native Sell path and vice versa, because the pool's labels are reversed.
+        let effective_direction = if self.flipped {
+            match direction {
+                SwapDirection::Buy => SwapDirection::Sell,
+                SwapDirection::Sell => SwapDirection::Buy,
+            }
+        } else {
+            direction
+        };
+
+        match effective_direction {
             SwapDirection::Buy => {
                 // Buy: Quote (SOL) -> Base (Token)
                 let base_mint = if Pubkey::from_str_const(WSOL) == self.pool.base_mint {
@@ -421,16 +454,11 @@ impl Market for RaydiumAmmV4Market {
         _user: Pubkey,
         direction: SwapDirection,
     ) -> Result<RequiredAccounts, GenericError> {
-        let wsol = Pubkey::from_str_const(WSOL);
-        let (sol_mint, token_mint) = if self.pool.base_mint == wsol {
-            (self.pool.base_mint, self.pool.quote_mint) // flipped: base=SOL, quote=Token
-        } else {
-            (self.pool.quote_mint, self.pool.base_mint) // standard: quote=SOL, base=Token
-        };
+        let meta = self.metadata()?;
 
         let (source_mint, destination_mint) = match direction {
-            SwapDirection::Buy => (sol_mint, token_mint),   // SOL -> Token
-            SwapDirection::Sell => (token_mint, sol_mint),   // Token -> SOL
+            SwapDirection::Buy => (meta.quote_mint, meta.base_mint),
+            SwapDirection::Sell => (meta.base_mint, meta.quote_mint),
         };
 
         Ok(RequiredAccounts {

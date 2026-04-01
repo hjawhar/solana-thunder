@@ -1,0 +1,43 @@
+[package]
+name = "thunder-aggregator"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "thunder-agg"
+path = "src/main.rs"
+
+[dependencies]
+# Workspace DEX crates
+thunder-core = { path = "../core" }
+raydium-amm-v4 = { path = "../raydium-amm-v4" }
+raydium-clmm = { path = "../raydium-clmm" }
+meteora-damm = { path = "../meteora-damm" }
+meteora-dlmm = { path = "../meteora-dlmm" }
+pumpfun-amm = { path = "../pumpfun-amm" }
+
+# Workspace deps
+solana-sdk = { workspace = true }
+solana-pubkey = { workspace = true }
+serde = { workspace = true }
+borsh = { workspace = true }
+spl-associated-token-account = { workspace = true }
+spl-token = { workspace = true }
+
+# Async + RPC
+tokio = { version = "1", features = ["full"] }
+solana-rpc-client = "3.0"
+solana-rpc-client-api = "3.0"
+solana-account-decoder-client-types = "3.0"
+solana-commitment-config = "3.0"
+
+# CLI
+indicatif = "0.17"
+rustyline = "15"
+
+# Stats
+sysinfo = "0.34"
+
+# Price API fallback + serialization
+reqwest = { version = "0.12", features = ["json"] }
+serde_json = "1.0"

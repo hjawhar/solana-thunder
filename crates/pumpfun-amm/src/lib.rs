@@ -9,7 +9,7 @@ use spl_associated_token_account::instruction::create_associated_token_account_i
 use thunder_core::{
     BondingCurve, GenericError, Market, PoolFees, PoolFinancials, PoolMetadata, RequiredAccounts,
     SwapArgs, SwapContext, SwapDirection, TOKEN_PROGRAM,
-    calculate_price_impact_bps,
+    calculate_price_impact_bps, infer_mint_decimals,
 };
 
 use crate::pda::{
@@ -87,11 +87,13 @@ pub struct SellSwapInstructionArgs {
 pub struct PumpfunAmmMarket {
     pub pool: PumpfunAmmPool,
     pub pool_address: String,
+    pub base_decimals: u8,
 }
 
 impl PumpfunAmmMarket {
     pub fn new(pool: PumpfunAmmPool, pool_address: String) -> Self {
-        Self { pool, pool_address }
+        let base_decimals = infer_mint_decimals(&pool.base_mint);
+        Self { pool, pool_address, base_decimals }
     }
 
     /// Calculate bonding curve output using virtual reserves and constant-product formula.
@@ -167,10 +169,10 @@ impl Market for PumpfunAmmMarket {
             .ok_or("Bonding curve data not available")?;
 
         Ok(PoolFinancials {
-            quote_balance: bonding_curve.real_token_reserves,
-            base_balance: bonding_curve.real_sol_reserves,
-            quote_decimals: 6,
-            base_decimals: 9,
+            quote_balance: bonding_curve.real_sol_reserves,
+            base_balance: bonding_curve.real_token_reserves,
+            quote_decimals: 9,
+            base_decimals: self.base_decimals,
         })
     }
 
@@ -229,7 +231,11 @@ impl Market for PumpfunAmmMarket {
             return Err("Bonding curve has zero virtual token reserves".into());
         }
 
-        Ok(bonding_curve.virtual_sol_reserves as f64 / bonding_curve.virtual_token_reserves as f64)
+        // Raw price in lamports: SOL_lamports / token_raw_units
+        let raw = bonding_curve.virtual_sol_reserves as f64 / bonding_curve.virtual_token_reserves as f64;
+        // Adjust: (sol / 10^9) / (tokens / 10^base_dec) = raw * 10^base_dec / 10^9
+        let decimal_adj = 10f64.powi(self.base_decimals as i32 - 9);
+        Ok(raw * decimal_adj)
     }
 
     fn build_swap_instruction(

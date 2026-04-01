@@ -230,7 +230,12 @@ pub struct MeteoraDAMMV2Pool {
     pub fee_b_per_liquidity: [u8; 32],
     pub permanent_lock_liquidity: u128,
     pub metrics: PoolMetrics,
-    pub _padding_1: [u64; 10],
+    pub creator: solana_pubkey::Pubkey,
+    pub token_a_amount: u64,
+    pub token_b_amount: u64,
+    pub layout_version: u8,
+    pub _padding_3: [u8; 7],
+    pub _padding_4: [u64; 3],
     pub reward_infos: [RewardInfo; 2],
 }
 
