@@ -209,6 +209,11 @@ impl MeteoraDlmmMarket {
 // ---------------------------------------------------------------------------
 
 impl Market for MeteoraDlmmMarket {
+    fn is_active(&self) -> bool {
+        // 0 = Enabled, 1 = Disabled (Meteora PairStatus enum).
+        self.pool.status == 0
+    }
+
     fn metadata(&self) -> Result<PoolMetadata, GenericError> {
         // Fee = base_factor * bin_step / 10_000 (in bps).
         let trade_fee_bps = (self.pool.parameters.base_factor as u64 * self.pool.bin_step as u64) / 10_000;

@@ -97,6 +97,46 @@ impl CachedPool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Auxiliary PDA extraction from cached pool data
+// ---------------------------------------------------------------------------
+
+use std::str::FromStr;
+use solana_pubkey::Pubkey;
+
+/// Extract tick array PDAs for a CLMM pool from its serialized cached data.
+/// Returns `(pool_pubkey, tick_array_pdas)` or None for non-CLMM pools.
+pub fn extract_clmm_tick_pdas(cached_data: &[u8]) -> Option<(Pubkey, Vec<Pubkey>)> {
+    let cached: CachedPool = bincode::deserialize(cached_data).ok()?;
+    match cached {
+        CachedPool::RaydiumClmm { addr, pool, .. } => {
+            let pool_id = Pubkey::from_str(&addr).ok()?;
+            let pdas = raydium_clmm::tick_arrays::derive_pool_tick_array_pdas(&pool, &pool_id);
+            if pdas.is_empty() { None } else { Some((pool_id, pdas)) }
+        }
+        _ => None,
+    }
+}
+
+/// Extract the active bin array PDA for a DLMM pool from its serialized cached data.
+/// Returns `(pool_pubkey, bin_array_pda)` or None for non-DLMM pools.
+pub fn extract_dlmm_bin_pda(cached_data: &[u8]) -> Option<(Pubkey, Pubkey)> {
+    let cached: CachedPool = bincode::deserialize(cached_data).ok()?;
+    match cached {
+        CachedPool::MeteoraDLMM { addr, pool, .. } => {
+            let pool_pubkey = Pubkey::from_str(&addr).ok()?;
+            let index = (pool.active_id as i64).div_euclid(70);
+            let dlmm_program = Pubkey::from_str_const(meteora_dlmm::METEORA_DYNAMIC_LMM);
+            let (pda, _) = Pubkey::find_program_address(
+                &[b"bin_array", pool_pubkey.as_ref(), &index.to_le_bytes()],
+                &dlmm_program,
+            );
+            Some((pool_pubkey, pda))
+        }
+        _ => None,
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct CacheHeader {
     version: u32,

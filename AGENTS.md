@@ -69,7 +69,7 @@ solana-thunder/
 |   +-- raydium-amm-v4/src/lib.rs       # RaydiumAMMV4 + RaydiumAmmV4Market
 |   +-- raydium-clmm/src/
 |   |   +-- lib.rs                      # RaydiumCLMMPool + RaydiumClmmMarket
-|   |   +-- tick_arrays.rs              # Tick array bitmap computation + tests
+|   |   +-- tick_arrays.rs              # Tick array bitmap + PDA derivation (derive_pool_tick_array_pdas)
 |   +-- meteora-damm/src/
 |   |   +-- lib.rs                      # V1 MeteoraDAMMMarket + V2 MeteoraDAMMV2Market
 |   |   +-- models.rs                   # Pool models for V1, V2
@@ -80,7 +80,7 @@ solana-thunder/
 |   |   +-- pda.rs                      # 10 PDA derivation functions
 |   +-- aggregator/src/                 # Pool loading, routing, swap building, caching, CLI
 |   |   +-- loader.rs                   # Async RPC pool loading (all DEXs, no mint filter)
-|   |   +-- cache.rs                    # Disk cache (~1.6 GB for 2M pools)
+|   |   +-- cache.rs                    # Disk cache + PDA extraction (extract_clmm_tick_pdas, extract_dlmm_bin_pda)
 |   |   +-- router.rs                   # Multi-hop routing (1-4 hops, swappable filter)
 |   |   +-- swap_builder.rs             # Swap instructions for all 6 DEXs
 |   |   +-- price.rs                    # SOL/USD on-chain via CLMM sqrt_price
@@ -89,8 +89,8 @@ solana-thunder/
 |   |   +-- main.rs                     # CLI binary (thunder-agg)
 |   +-- engine/src/                     # Persistent service (library only, binary in bin/)
 |   |   +-- account_store.rs            # DashMap store for all account data
-|   |   +-- pool_registry.rs            # Pool index + swappable validation per DEX
-|   |   +-- cold_start.rs               # Batch-fetch vaults, tick arrays, bitmap exts
+|   |   +-- pool_registry.rs            # Pool index + swappable validation (bin_array, tick_arrays, bitmap_ext)
+|   |   +-- cold_start.rs               # Batch-fetch vaults, tick arrays (PDA-based), bin arrays, bitmap exts
 |   |   +-- streaming.rs                # Yellowstone gRPC subscriber
 |   |   +-- api.rs                      # Axum HTTP: /quote, /swap, /price, /health
 |   +-- router-program/                 # On-chain CPI router (excluded from workspace)
@@ -183,9 +183,18 @@ solana -u http://127.0.0.1:8899 program deploy \
 
 Fetches ALL pools from all 6 DEXs using `getProgramAccounts` with discriminator + dataSize filters only (no mint filter). ~2M pools total. Vault balances fetched via `getMultipleAccounts` in batches of 100, 20 concurrent.
 
+### Cold Start Auxiliary Fetches
+
+After pool loading, the engine cold start fetches auxiliary accounts needed for swappability:
+
+1. **Vault balances** -- `getMultipleAccounts` for all pool vault token accounts
+2. **DLMM bitmap extensions** -- single GPA for `dataSize=12488` accounts
+3. **CLMM tick arrays** -- PDA-derived from each pool's `tick_array_bitmap`, fetched via `getMultipleAccounts` (top 10k pools by vault balance, ~6 tick arrays each)
+4. **DLMM bin arrays** -- PDA-derived from each pool's `active_id`, fetched via `getMultipleAccounts`
+
 ### Pool Cache
 
-Saved to `pools.cache` (~1.6 GB) after first load. Subsequent startups load in ~6s vs ~4min from RPC. Uses bincode-serialized `CachedPool` enum with per-DEX pool variants.
+Saved to `pools.cache` (~1.6 GB) after first load. Subsequent startups load in ~6s vs ~4min from RPC. Uses bincode-serialized `CachedPool` enum with per-DEX pool variants. `CachedPool` also serves as the source for PDA extraction (`extract_clmm_tick_pdas`, `extract_dlmm_bin_pda`) during cold start.
 
 ### REPL Commands
 
@@ -212,6 +221,19 @@ pub trait Market: Send + Sync {
     // ... default convenience methods
 }
 ```
+
+### Pool Status & `is_active()`
+
+Each DEX has its own on-chain status semantics. `is_active()` overrides check the raw status field:
+
+| DEX | Status field | Active condition | Source |
+|---|---|---|---|
+| Raydium V4 | `status: u64` | `status == 6` | Raydium AMM status enum |
+| Raydium CLMM | `status: u8` (bitfield) | `status & (1 << 4) == 0` | Bit 4 = disable swap |
+| Meteora DAMM V1 | `enabled: bool` | `enabled == true` | Direct boolean |
+| Meteora DAMM V2 | `pool_status: u8` | `pool_status == 0` | `PoolStatus::Enable = 0` |
+| Meteora DLMM | `status: u8` | `status == 0` | `PairStatus::Enabled = 0` |
+| Pumpfun AMM | (none) | default `true` | No on-chain status field |
 
 ### Swap Builder
 
@@ -256,14 +278,14 @@ let ix = swap_builder::build_clmm_swap(&ClmmSwapAccounts { ... }, amount, min_ou
 |---|---|
 | `bin/engine.rs` | Engine binary entry point (startup, env parsing) |
 | `crates/engine/src/account_store.rs` | DashMap store for all account data (pools, vaults, tick arrays) |
-| `crates/engine/src/pool_registry.rs` | Pool index + per-DEX swappable validation |
-| `crates/engine/src/cold_start.rs` | Batch-fetch vaults, tick arrays, bitmap extensions on startup |
+| `crates/engine/src/pool_registry.rs` | Pool index + per-DEX swappable validation (`bin_array`, `tick_arrays`, `bitmap_ext` fields) |
+| `crates/engine/src/cold_start.rs` | Batch-fetch vaults, tick arrays (PDA-derived), bin arrays, bitmap extensions |
 | `crates/engine/src/streaming.rs` | Yellowstone gRPC subscriber for live account updates |
 | `crates/engine/src/api.rs` | Axum HTTP: /quote (<50ms), /swap, /price (<5ms), /health |
 | `crates/aggregator/src/swap_builder.rs` | Swap instructions for all 6 DEXs (+ from_pool_data variants) |
 | `crates/aggregator/src/router.rs` | Multi-hop routing (1-4 hops, swappable filter) |
 | `crates/aggregator/src/loader.rs` | RPC pool loading (discriminator + dataSize filters) |
-| `crates/aggregator/src/cache.rs` | Disk cache: save/load 2M pools (~1.6 GB) |
+| `crates/aggregator/src/cache.rs` | Disk cache + PDA extraction helpers (`extract_clmm_tick_pdas`, `extract_dlmm_bin_pda`) |
 | `crates/core/src/traits.rs` | Market trait, PoolMetadata, PoolFinancials, is_active() |
 | `crates/router-program/src/lib.rs` | On-chain CPI router with exact amount chaining |
 | `tests/surfpool_swap.rs` | Dynamic multi-hop swap on Surfpool (any token pair) |

@@ -17,7 +17,6 @@ use crate::pool_registry::PoolRegistry;
 const BATCH_SIZE: usize = 100;
 const BATCH_CONCURRENCY: usize = 20;
 
-const CLMM_PROGRAM_ID: &str = "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK";
 const DLMM_PROGRAM_ID: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
 
 /// Fetch all vault accounts from the registry and store them in the AccountStore.
@@ -75,23 +74,15 @@ pub async fn fetch_all_vaults(
     println!("[cold_start] vaults done: {fetched}/{total} stored");
 }
 
-/// Fetch all CLMM tick arrays in one getProgramAccounts call, then assign to top pools.
-///
-/// Strategy: single GPA for all tick arrays owned by the CLMM program (discriminated
-/// by the 8-byte account discriminator implicitly via dataSize or memcmp). We request
-/// full account data so we can store them directly. Then we group by pool_id (offset 8)
-/// and keep only tick arrays belonging to the top 10,000 CLMM pools by vault balance.
+/// Fetch CLMM tick arrays by deriving PDAs from each pool's bitmap, then
+/// batch-fetching with getMultipleAccounts. Replaces the previous single-GPA
+/// approach which failed on large response payloads.
 pub async fn fetch_tick_arrays(
     rpc: &RpcClient,
     registry: &mut PoolRegistry,
     store: &AccountStore,
 ) {
-    let clmm_program = match Pubkey::from_str(CLMM_PROGRAM_ID) {
-        Ok(pk) => pk,
-        Err(_) => return,
-    };
-
-    // Collect CLMM pools and sort by vault balance descending.
+    // Collect CLMM pools sorted by vault balance descending.
     let mut clmm_pools: Vec<(&str, u64)> = registry
         .iter_pools()
         .filter(|(_, info)| info.dex_name == "Raydium CLMM")
@@ -110,83 +101,165 @@ pub async fn fetch_tick_arrays(
         return;
     }
 
-    // Build a set of top pool pubkeys for fast lookup.
-    let top_pool_set: HashMap<Pubkey, String> = clmm_pools
-        .iter()
-        .filter_map(|(addr, _)| {
-            Pubkey::from_str(addr).ok().map(|pk| (pk, addr.to_string()))
-        })
-        .collect();
+    // Derive tick array PDAs from each pool's cached data (bitmap + current tick).
+    let pool_addrs: Vec<String> = clmm_pools.iter().map(|(a, _)| a.to_string()).collect();
+    let mut pool_tick_map: HashMap<String, Vec<Pubkey>> = HashMap::new();
+    let mut all_pdas: Vec<Pubkey> = Vec::new();
 
-    println!(
-        "[cold_start] fetching tick arrays for {} CLMM pools (single GPA)",
-        top_pool_set.len()
-    );
-
-    // Single GPA: fetch all tick array accounts. Tick arrays are 10240 bytes.
-    let config = RpcProgramAccountsConfig {
-        filters: Some(vec![RpcFilterType::DataSize(10240)]),
-        account_config: RpcAccountInfoConfig {
-            encoding: Some(UiAccountEncoding::Base64),
-            commitment: Some(CommitmentConfig::confirmed()),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-
-    let all_tick_arrays = match rpc
-        .get_program_accounts_with_config(&clmm_program, config)
-        .await
-    {
-        Ok(accounts) => accounts,
-        Err(e) => {
-            eprintln!("[cold_start] tick array GPA error: {e}");
-            return;
+    for addr in &pool_addrs {
+        let cached_data = match registry.get_pool(addr).map(|i| &i.cached_data) {
+            Some(d) if !d.is_empty() => d,
+            _ => continue,
+        };
+        if let Some((_pool_id, pdas)) = thunder_aggregator::cache::extract_clmm_tick_pdas(cached_data) {
+            pool_tick_map.insert(addr.clone(), pdas.clone());
+            all_pdas.extend(pdas);
         }
-    };
-
-    println!(
-        "[cold_start] GPA returned {} tick array accounts, filtering to top pools",
-        all_tick_arrays.len()
-    );
-
-    // Group tick arrays by pool_id and keep only those for top pools.
-    // pool_id is at offset 8 in tick array account data (32 bytes).
-    let mut pool_tick_arrays: HashMap<Pubkey, Vec<Pubkey>> = HashMap::new();
-    let mut stored = 0usize;
-
-    for (pubkey, account) in all_tick_arrays {
-        if account.data.len() < 40 {
-            continue;
-        }
-
-        let pool_id = Pubkey::try_from(&account.data[8..40]).unwrap();
-
-        if !top_pool_set.contains_key(&pool_id) {
-            continue;
-        }
-
-        store.upsert(pubkey, account.data, account.owner, account.lamports, 0);
-        pool_tick_arrays
-            .entry(pool_id)
-            .or_default()
-            .push(pubkey);
-        stored += 1;
     }
 
-    // Assign tick arrays to pool infos.
-    for (pool_id, tick_keys) in &pool_tick_arrays {
-        if let Some(addr) = top_pool_set.get(pool_id) {
-            if let Some(pool_info) = registry.get_pool_mut(addr) {
-                pool_info.tick_arrays = tick_keys.clone();
+    // Deduplicate.
+    all_pdas.sort();
+    all_pdas.dedup();
+
+    println!(
+        "[cold_start] fetching {} tick array accounts for {} CLMM pools",
+        all_pdas.len(),
+        pool_tick_map.len()
+    );
+
+    // Batch fetch with getMultipleAccounts.
+    let mut fetched = 0usize;
+    let chunks: Vec<&[Pubkey]> = all_pdas.chunks(BATCH_SIZE).collect();
+
+    for window in chunks.chunks(BATCH_CONCURRENCY) {
+        let futures: Vec<_> = window
+            .iter()
+            .map(|chunk| rpc.get_multiple_accounts(chunk))
+            .collect();
+        let results = join_all(futures).await;
+
+        for (chunk, result) in window.iter().zip(results) {
+            match result {
+                Ok(accounts) => {
+                    for (pubkey, maybe_account) in chunk.iter().zip(accounts) {
+                        if let Some(account) = maybe_account {
+                            store.upsert(
+                                *pubkey,
+                                account.data,
+                                account.owner,
+                                account.lamports,
+                                0,
+                            );
+                            fetched += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[cold_start] tick array batch error: {e}");
+                }
             }
         }
     }
 
+    // Assign tick arrays to pool infos, keeping only those that exist on-chain.
+    for (addr, pdas) in &pool_tick_map {
+        if let Some(pool_info) = registry.get_pool_mut(addr) {
+            pool_info.tick_arrays = pdas
+                .iter()
+                .filter(|pk| store.contains(pk))
+                .cloned()
+                .collect();
+        }
+    }
+
     println!(
-        "[cold_start] tick arrays: {stored} stored across {} pools",
-        pool_tick_arrays.len()
+        "[cold_start] tick arrays: {fetched} stored across {} pools",
+        pool_tick_map.len()
     );
+}
+
+/// Fetch DLMM bin array accounts for the active bin of each pool.
+/// Derives bin array PDAs from cached pool data, batch-fetches them,
+/// and records the PDA on each PoolInfo so the swappable check can
+/// verify existence in the store without re-deriving.
+pub async fn fetch_dlmm_bin_arrays(
+    rpc: &RpcClient,
+    registry: &mut PoolRegistry,
+    store: &AccountStore,
+) {
+    // Derive bin array PDAs for all DLMM pools.
+    let mut pda_map: HashMap<String, Pubkey> = HashMap::new(); // pool_addr -> bin_array PDA
+    let mut all_pdas: Vec<Pubkey> = Vec::new();
+
+    for (addr, info) in registry.iter_pools() {
+        if info.dex_name != "Meteora DLMM" {
+            continue;
+        }
+        // Skip pools that already have a bitmap extension (they pass the
+        // swappable check without a bin array).
+        if info.bitmap_ext.is_some() {
+            continue;
+        }
+        if let Some((_pool_pk, pda)) = thunder_aggregator::cache::extract_dlmm_bin_pda(&info.cached_data) {
+            pda_map.insert(addr.to_string(), pda);
+            all_pdas.push(pda);
+        }
+    }
+
+    all_pdas.sort();
+    all_pdas.dedup();
+
+    if all_pdas.is_empty() {
+        return;
+    }
+
+    println!(
+        "[cold_start] fetching {} DLMM bin array accounts for {} pools",
+        all_pdas.len(),
+        pda_map.len()
+    );
+
+    let mut fetched = 0usize;
+    let chunks: Vec<&[Pubkey]> = all_pdas.chunks(BATCH_SIZE).collect();
+
+    for window in chunks.chunks(BATCH_CONCURRENCY) {
+        let futures: Vec<_> = window
+            .iter()
+            .map(|chunk| rpc.get_multiple_accounts(chunk))
+            .collect();
+        let results = join_all(futures).await;
+
+        for (chunk, result) in window.iter().zip(results) {
+            match result {
+                Ok(accounts) => {
+                    for (pubkey, maybe_account) in chunk.iter().zip(accounts) {
+                        if let Some(account) = maybe_account {
+                            store.upsert(
+                                *pubkey,
+                                account.data,
+                                account.owner,
+                                account.lamports,
+                                0,
+                            );
+                            fetched += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[cold_start] DLMM bin array batch error: {e}");
+                }
+            }
+        }
+    }
+
+    // Record the bin array PDA on each pool info.
+    for (addr, pda) in &pda_map {
+        if let Some(pool_info) = registry.get_pool_mut(addr) {
+            pool_info.bin_array = Some(*pda);
+        }
+    }
+
+    println!("[cold_start] DLMM bin arrays: {fetched} stored for {} pools", pda_map.len());
 }
 
 /// Fetch all DLMM bitmap extension accounts (dataSize=12488) and assign to pools.
@@ -273,10 +346,13 @@ pub async fn cold_start(
     // 3. Tick arrays (depends on vault balances for sorting).
     fetch_tick_arrays(rpc, registry, store).await;
 
-    // 4. Validate all pools against the now-populated store.
+    // 4. DLMM bin arrays (depends on bitmap extensions for skip logic).
+    fetch_dlmm_bin_arrays(rpc, registry, store).await;
+
+    // 5. Validate all pools against the now-populated store.
     registry.validate_all(store);
 
-    // 5. Summary.
+    // 6. Summary.
     println!("[cold_start] === cold start complete ===");
     println!("[cold_start] total accounts in store: {}", store.len());
     println!(

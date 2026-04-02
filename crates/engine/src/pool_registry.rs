@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use solana_pubkey::Pubkey;
@@ -9,8 +8,6 @@ use thunder_core::Market;
 
 use crate::account_store::AccountStore;
 
-/// DLMM program ID for bin array PDA derivation.
-const DLMM_PROGRAM: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
 
 /// Pool with metadata, swappable flag, and DEX-specific auxiliary accounts.
 pub struct PoolInfo {
@@ -26,6 +23,8 @@ pub struct PoolInfo {
     pub tick_arrays: Vec<Pubkey>,
     /// DLMM bitmap extension account, populated by cold_start.
     pub bitmap_ext: Option<Pubkey>,
+    /// DLMM active bin array PDA, populated by cold_start.
+    pub bin_array: Option<Pubkey>,
     /// Serialized pool data for disk cache.
     pub cached_data: Vec<u8>,
 }
@@ -85,6 +84,7 @@ impl PoolRegistry {
                 base_vault: meta.base_vault,
                 tick_arrays: Vec::new(),
                 bitmap_ext: None,
+                bin_array: None,
                 cached_data: owned_entry.cached_data,
             };
 
@@ -238,7 +238,8 @@ fn check_swappable(info: &PoolInfo, store: &AccountStore) -> bool {
             if info.bitmap_ext.is_some() {
                 return true;
             }
-            dlmm_bin_array_exists(info, store)
+            // Active bin array must exist in the store.
+            info.bin_array.is_some_and(|pda| store.contains(&pda))
         }
 
         // Unknown DEX: be conservative.
@@ -250,42 +251,4 @@ fn check_swappable(info: &PoolInfo, store: &AccountStore) -> bool {
 fn vaults_funded(info: &PoolInfo, store: &AccountStore) -> bool {
     store.read_token_balance(&info.quote_vault) > 0
         && store.read_token_balance(&info.base_vault) > 0
-}
-
-/// Check that the DLMM bin array PDA for the pool's active_id exists in the store.
-///
-/// Layout: active_id is an i32 at byte offset 76 in the pool account data.
-/// PDA seeds: `["bin_array", pool_pubkey, index.to_le_bytes()]`
-/// where `index = (active_id as i64).div_euclid(70)`.
-fn dlmm_bin_array_exists(info: &PoolInfo, store: &AccountStore) -> bool {
-    let pool_pubkey = match Pubkey::from_str(&info.address) {
-        Ok(pk) => pk,
-        Err(_) => return false,
-    };
-
-    let account_data = match store.get_data(&pool_pubkey) {
-        Some(d) => d,
-        None => return false,
-    };
-
-    if account_data.len() < 80 {
-        return false;
-    }
-    let active_id = i32::from_le_bytes(
-        account_data[76..80].try_into().unwrap(),
-    );
-
-    let index = (active_id as i64).div_euclid(70);
-
-    let dlmm_program = match Pubkey::from_str(DLMM_PROGRAM) {
-        Ok(pk) => pk,
-        Err(_) => return false,
-    };
-
-    let (pda, _) = Pubkey::find_program_address(
-        &[b"bin_array", pool_pubkey.as_ref(), &index.to_le_bytes()],
-        &dlmm_program,
-    );
-
-    store.contains(&pda)
 }

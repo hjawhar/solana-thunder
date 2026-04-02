@@ -137,6 +137,48 @@ fn is_tick_array_initialized(
     false
 }
 
+/// Derive tick array PDAs for all initialized tick arrays near the current tick.
+/// Scans both directions (buy and sell) from the current tick array, collecting
+/// up to `NUM_REMAINING_TICK_ARRAYS` per direction. Used during cold start to
+/// pre-fetch tick array accounts without a massive getProgramAccounts call.
+pub fn derive_pool_tick_array_pdas(
+    pool: &RaydiumCLMMPool,
+    pool_id: &Pubkey,
+) -> Vec<Pubkey> {
+    let ticks_per_array = pool.tick_spacing as i32 * TICK_ARRAY_SIZE;
+    if ticks_per_array == 0 {
+        return vec![];
+    }
+
+    let current_start = get_tick_array_start_index(pool.tick_current, pool.tick_spacing);
+    let mut pdas = Vec::new();
+
+    // Search both directions from the current tick array.
+    for direction in [-1i32, 1] {
+        let step = direction * ticks_per_array;
+        let mut pos = current_start;
+        let mut found = 0;
+        while found < NUM_REMAINING_TICK_ARRAYS {
+            let idx = pos.div_euclid(ticks_per_array);
+            // In-pool bitmap covers tick array indices -512..+511.
+            if idx < -512 || idx > 511 {
+                break;
+            }
+            if is_tick_array_initialized_in_bitmap(&pool.tick_array_bitmap, idx) {
+                if let Ok((pda, _)) = pda_tick_array_address(pool_id, pos) {
+                    pdas.push(pda);
+                    found += 1;
+                }
+            }
+            pos += step;
+        }
+    }
+
+    pdas.sort();
+    pdas.dedup();
+    pdas
+}
+
 /// Compute the tick array remaining accounts for a CLMM swap locally.
 ///
 /// This replaces the external HTTP API call to `clmm.liquidharmony.xyz/remaining_accounts`.

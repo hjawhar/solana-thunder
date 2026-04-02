@@ -207,6 +207,11 @@ impl RaydiumClmmMarket {
 // ============================================================================
 
 impl Market for RaydiumClmmMarket {
+    fn is_active(&self) -> bool {
+        // Bitfield: bit4 = disable swap. Pool is swappable when bit4 is clear.
+        self.pool.status & (1 << 4) == 0
+    }
+
     fn metadata(&self) -> Result<PoolMetadata, GenericError> {
         // CLMM fees are typically 0.25% (25 bps)
         let trade_fee_bps = 25u64;

@@ -316,7 +316,7 @@ impl MeteoraDAMMV2Market {
 
 impl Market for MeteoraDAMMV2Market {
     fn is_active(&self) -> bool {
-        self.pool.pool_status == 1
+        self.pool.pool_status == 0
     }
 
     fn metadata(&self) -> Result<PoolMetadata, GenericError> {
