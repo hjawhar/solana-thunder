@@ -107,17 +107,19 @@ async fn handle_quote(
 
     let start = Instant::now();
 
-    let router = Router::new(&state.pool_index, 4);
+    // Build swappable set BEFORE routing so the router only considers
+    // executable pools. Without this, the top-N routes might all go through
+    // non-swappable pools and get discarded by post-filtering, hiding viable routes.
+    let swappable = state.registry.read().await.swappable_set();
+    let router = Router::new(&state.pool_index, 4)
+        .with_swappable_set(swappable);
     let quote = router
         .find_routes(input_mint, output_mint, params.amount, 10)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("routing error: {e}")))?;
 
-    // Filter routes: every hop must use a swappable pool.
-    let swappable = state.registry.read().await.swappable_set();
     let routes: Vec<RouteJson> = quote
         .routes
         .into_iter()
-        .filter(|route| route.hops.iter().all(|hop| swappable.contains(&hop.pool_address)))
         .map(|route| RouteJson {
             output_amount: route.output_amount.to_string(),
             price_impact_bps: route.price_impact_bps,

@@ -472,7 +472,7 @@ fn simulate_hop(
     let entry = index.get_pool(pool_address)?;
     let meta = entry.market.metadata().ok()?;
 
-    // Skip inactive pools (e.g. DAMM V2 pool_status != 1).
+    // Skip inactive pools (status field check per DEX).
     if !entry.market.is_active() {
         return None;
     }
