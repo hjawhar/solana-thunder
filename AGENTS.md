@@ -58,6 +58,8 @@ Raw account bytes --BorshDeserialize--> Pool model struct
 
 ```
 solana-thunder/
++-- bin/
+|   +-- engine.rs                       # Engine binary entry point
 +-- Cargo.toml                          # Workspace root
 +-- src/lib.rs                          # Root crate: re-exports all DEX crates
 +-- crates/
@@ -76,19 +78,23 @@ solana-thunder/
 |   +-- pumpfun-amm/src/
 |   |   +-- lib.rs                      # PumpfunAmmPool + PumpfunAmmMarket
 |   |   +-- pda.rs                      # 10 PDA derivation functions
-|   +-- aggregator/src/
+|   +-- aggregator/src/                 # Pool loading, routing, swap building, caching, CLI
 |   |   +-- loader.rs                   # Async RPC pool loading (all DEXs, no mint filter)
-|   |   +-- cache.rs                    # Disk cache (bincode, ~1.6 GB for 2M pools)
-|   |   +-- router.rs                   # Multi-hop route finding (1-4 hops, bidirectional BFS)
-|   |   +-- swap_builder.rs            # Centralized swap instructions for all 6 DEXs
+|   |   +-- cache.rs                    # Disk cache (~1.6 GB for 2M pools)
+|   |   +-- router.rs                   # Multi-hop routing (1-4 hops, swappable filter)
+|   |   +-- swap_builder.rs             # Swap instructions for all 6 DEXs
 |   |   +-- price.rs                    # SOL/USD on-chain via CLMM sqrt_price
-|   |   +-- pool_index.rs             # In-memory token-pair graph
+|   |   +-- pool_index.rs               # In-memory token-pair graph
 |   |   +-- cli.rs                      # Progress bars + interactive REPL
-|   |   +-- stats.rs                    # Pool and system statistics
-|   |   +-- types.rs                    # PoolEntry, Route, RouteHop, Quote, etc.
 |   |   +-- main.rs                     # CLI binary (thunder-agg)
-|   +-- router-program/                # On-chain router (excluded from workspace)
-|       +-- src/lib.rs                  # CPI multi-hop swap program
+|   +-- engine/src/                     # Persistent service (library only, binary in bin/)
+|   |   +-- account_store.rs            # DashMap store for all account data
+|   |   +-- pool_registry.rs            # Pool index + swappable validation per DEX
+|   |   +-- cold_start.rs               # Batch-fetch vaults, tick arrays, bitmap exts
+|   |   +-- streaming.rs                # Yellowstone gRPC subscriber
+|   |   +-- api.rs                      # Axum HTTP: /quote, /swap, /price, /health
+|   +-- router-program/                 # On-chain CPI router (excluded from workspace)
+|       +-- src/lib.rs                   # CPI multi-hop swap program
 +-- tests/
     +-- surfpool_swap.rs                # Dynamic multi-hop swap on Surfpool (any token pair)
     +-- trade_stream.rs                 # Live DEX swap streaming via Yellowstone gRPC
@@ -103,12 +109,21 @@ solana-thunder/
 cargo check                        # Type-check all crates
 cargo build                        # Build all crates
 cargo test                         # Run unit tests
-cargo build --release -p thunder-aggregator  # Build aggregator binary
+cargo build --release --bin thunder-engine  # Build engine binary
+cargo build --release -p thunder-aggregator  # Build aggregator CLI
 
-# Run aggregator CLI
+# Run engine (persistent service with HTTP API)
+RPC_URL="https://..." cargo run --release --bin thunder-engine
+
+# Run aggregator CLI (interactive REPL)
 RPC_URL="https://..." cargo run --release -p thunder-aggregator
 
-# Run Surfpool swap test (any token)
+# Engine API
+curl http://localhost:8080/health
+curl "http://localhost:8080/quote?inputMint=SOL&outputMint=6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN&amount=100000000"
+curl "http://localhost:8080/price?mint=SOL"
+
+# Surfpool swap test
 INPUT=SOL OUTPUT=6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN AMOUNT=0.1 MAX_HOPS=2 \
   cargo test --release --test surfpool_swap -- --nocapture
 ```
@@ -239,14 +254,19 @@ let ix = swap_builder::build_clmm_swap(&ClmmSwapAccounts { ... }, amount, min_ou
 
 | File | What it is |
 |---|---|
-| `crates/aggregator/src/swap_builder.rs` | Centralized swap instructions for all 6 DEXs |
-| `crates/aggregator/src/loader.rs` | Async RPC pool loading (discriminator + dataSize filters) |
-| `crates/aggregator/src/cache.rs` | Disk cache: save/load 2M pools as bincode (~1.6 GB) |
-| `crates/aggregator/src/router.rs` | Multi-hop route finding (1-4 hops, bidirectional) |
-| `crates/aggregator/src/price.rs` | SOL/USD on-chain via CLMM sqrt_price |
+| `bin/engine.rs` | Engine binary entry point (startup, env parsing) |
+| `crates/engine/src/account_store.rs` | DashMap store for all account data (pools, vaults, tick arrays) |
+| `crates/engine/src/pool_registry.rs` | Pool index + per-DEX swappable validation |
+| `crates/engine/src/cold_start.rs` | Batch-fetch vaults, tick arrays, bitmap extensions on startup |
+| `crates/engine/src/streaming.rs` | Yellowstone gRPC subscriber for live account updates |
+| `crates/engine/src/api.rs` | Axum HTTP: /quote (<50ms), /swap, /price (<5ms), /health |
+| `crates/aggregator/src/swap_builder.rs` | Swap instructions for all 6 DEXs (+ from_pool_data variants) |
+| `crates/aggregator/src/router.rs` | Multi-hop routing (1-4 hops, swappable filter) |
+| `crates/aggregator/src/loader.rs` | RPC pool loading (discriminator + dataSize filters) |
+| `crates/aggregator/src/cache.rs` | Disk cache: save/load 2M pools (~1.6 GB) |
 | `crates/core/src/traits.rs` | Market trait, PoolMetadata, PoolFinancials, is_active() |
-| `crates/router-program/src/lib.rs` | On-chain CPI router program |
-| `tests/surfpool_swap.rs` | Dynamic multi-hop swap on Surfpool (SOL -> any token, auto-routing) |
+| `crates/router-program/src/lib.rs` | On-chain CPI router with exact amount chaining |
+| `tests/surfpool_swap.rs` | Dynamic multi-hop swap on Surfpool (any token pair) |
 
 ## Runtime / Tooling
 
@@ -255,4 +275,5 @@ let ix = swap_builder::build_clmm_swap(&ClmmSwapAccounts { ... }, amount, min_ou
 - **Workspace resolver:** 3
 - **7 workspace dependencies:** `serde`, `solana-sdk`, `solana-pubkey`, `solana-system-interface`, `spl-associated-token-account`, `spl-token`, `borsh`
 - **Aggregator dependencies:** `tokio`, `futures`, `solana-rpc-client`, `indicatif`, `rustyline`, `sysinfo`, `bincode`
+- **Engine dependencies:** `axum`, `dashmap`, `tower-http`, `yellowstone-grpc-client`, `yellowstone-grpc-proto`, `rustls`
 - **Surfpool:** local mainnet fork, `surfnet_setAccount` cheatcode for token balances

@@ -32,6 +32,20 @@ A Rust DEX aggregator for Solana. Loads all pools across 6 DEX protocols, finds 
 
 ## Quick Start
 
+### Run the Engine (Jupiter-like API)
+
+The engine is a persistent service that keeps all pool data in memory and serves an HTTP API.
+
+```bash
+# Start the engine (loads pools, fetches accounts, starts API on port 8080)
+RPC_URL="https://your-rpc-endpoint.com" cargo run --release --bin thunder-engine
+
+# In another terminal:
+curl "http://localhost:8080/health"
+curl "http://localhost:8080/price?mint=SOL"
+curl "http://localhost:8080/quote?inputMint=SOL&outputMint=6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN&amount=100000000"
+```
+
 ### Run the Aggregator CLI
 
 ```bash
@@ -105,6 +119,9 @@ Output shows before/after balance diff:
 | `CACHE_MAX_AGE` | `3600` | Max cache age (seconds) before RPC reload |
 | `PRIVATE_KEY` | (none) | Base58 keypair (in `.env`, never committed) |
 | `SURFPOOL_URL` | `http://127.0.0.1:8899` | Surfpool local RPC |
+| `GEYSER_ENDPOINT` | (none) | Yellowstone gRPC endpoint for live streaming |
+| `GEYSER_TOKEN` | (none) | Yellowstone gRPC auth token |
+| `PORT` | `8080` | Thunder Engine HTTP API port |
 
 ## Architecture
 
@@ -119,51 +136,63 @@ thunder-core              Market trait, shared types, constants
     +-- pumpfun-amm       Bonding curve
 
 thunder-aggregator        Pool loading, routing, pricing, swap building, caching, CLI
+thunder-engine            Persistent service: AccountStore + gRPC streaming + HTTP API
 thunder-router            On-chain program for CPI multi-hop swaps (Surfpool)
 solana-thunder            Root crate: re-exports all DEX crates
 ```
 
-### Swap Execution Flow
+### Engine Service Flow
 
 ```
-Pool cache / RPC  -->  PoolIndex (2M pools, token graph)
-                            |
-                            v
-                    Router (BFS, 1-4 hops, bidirectional)
-                            |
-                            v
-                    swap_builder (correct Anchor account layouts per DEX)
-                            |
-                            v
-                    Surfpool (forked mainnet) --> real swap execution
+Yellowstone gRPC  --->  AccountStore (DashMap, all accounts in memory)
+                              |
+RPC cold start  ------------>|  vaults, tick arrays, bitmap extensions
+                              v
+                        PoolRegistry (2M pools, swappable flags)
+                              |
+                              v
+                    Router (BFS, 1-4 hops, swappable-only)
+                              |
+                              v
+                    HTTP API:  GET /quote (<50ms)
+                               POST /swap (<10ms)
+                               GET /price (<5ms)
 ```
 
 ### Project Structure
 
 ```
 solana-thunder/
++-- bin/
+|   +-- engine.rs                     Engine binary entry point
 +-- crates/
-|   +-- core/                       Market trait, shared types, constants
-|   +-- raydium-amm-v4/            RaydiumAMMV4 + RaydiumAmmV4Market
-|   +-- raydium-clmm/              RaydiumCLMMPool + RaydiumClmmMarket
-|   +-- meteora-damm/              MeteoraDAMMMarket + V2Market + models
-|   +-- meteora-dlmm/              MeteoraDLMMPool + MeteoraDlmmMarket
-|   +-- pumpfun-amm/               PumpfunAmmPool + PumpfunAmmMarket
-|   +-- aggregator/                Aggregator binary + library
+|   +-- core/                         Market trait, shared types, constants
+|   +-- raydium-amm-v4/               RaydiumAMMV4 + RaydiumAmmV4Market
+|   +-- raydium-clmm/                 RaydiumCLMMPool + RaydiumClmmMarket
+|   +-- meteora-damm/                 MeteoraDAMMMarket + V2Market + models
+|   +-- meteora-dlmm/                 MeteoraDLMMPool + MeteoraDlmmMarket
+|   +-- pumpfun-amm/                  PumpfunAmmPool + PumpfunAmmMarket
+|   +-- aggregator/                   Pool loading, routing, swap building, caching, CLI
 |   |   +-- src/
-|   |       +-- loader.rs          RPC pool loading (all DEXs, no mint filter)
-|   |       +-- cache.rs           Disk cache (bincode, ~1.6 GB for 2M pools)
-|   |       +-- router.rs          Multi-hop routing (1-4 hops, bidirectional BFS)
-|   |       +-- swap_builder.rs    Centralized swap instructions for all 6 DEXs
-|   |       +-- price.rs           On-chain pricing (CLMM sqrt_price for SOL/USD)
-|   |       +-- pool_index.rs     In-memory token-pair graph
-|   |       +-- cli.rs             Progress bars + REPL
-|   |       +-- stats.rs           Pool + system statistics
-|   +-- router-program/            On-chain router (CPI multi-hop, Surfpool)
+|   |       +-- loader.rs             RPC pool loading (all DEXs, no mint filter)
+|   |       +-- cache.rs              Disk cache (~1.6 GB for 2M pools)
+|   |       +-- router.rs             Multi-hop routing (1-4 hops, swappable filter)
+|   |       +-- swap_builder.rs       Swap instructions for all 6 DEXs
+|   |       +-- price.rs              On-chain pricing (CLMM sqrt_price)
+|   |       +-- pool_index.rs         In-memory token-pair graph
+|   |       +-- cli.rs                Progress bars + REPL
+|   +-- engine/                       Persistent service (library)
+|   |   +-- src/
+|   |       +-- account_store.rs      DashMap store for all account data
+|   |       +-- pool_registry.rs      Pool index + swappable validation
+|   |       +-- cold_start.rs         Batch-fetch vaults, tick arrays, bitmap exts
+|   |       +-- streaming.rs          Yellowstone gRPC subscriber
+|   |       +-- api.rs                Axum HTTP: /quote, /swap, /price, /health
+|   +-- router-program/               On-chain CPI router (Surfpool)
 +-- tests/
-    +-- surfpool_swap.rs           2-hop swap test on Surfpool (SOL->USDC->TRUMP)
-    +-- trade_stream.rs            Live DEX swap streaming via Yellowstone gRPC
-    +-- creation_stream.rs         Token + pool creation streaming
+    +-- surfpool_swap.rs              Dynamic multi-hop swap on Surfpool
+    +-- trade_stream.rs               Live DEX swap streaming (gRPC)
+    +-- creation_stream.rs            Token + pool creation streaming
 ```
 
 ## Using as a Library

@@ -416,3 +416,147 @@ pub fn build_pumpfun_swap(
 
     Ok(Instruction { program_id: program, accounts: keys, data })
 }
+
+// =========================================================================
+// From-pool-data helpers (for AccountStore-based swap building)
+// =========================================================================
+
+/// Build a DLMM swap instruction from raw on-chain pool account bytes.
+///
+/// The caller reads pool data from an AccountStore (or any source) and passes
+/// the raw bytes here. This avoids coupling the aggregator crate to engine types.
+///
+/// `in_program` / `out_program` are the SPL token programs for the input / output
+/// mints respectively. The function maps them to token_x_program / token_y_program
+/// based on which pool mint matches `input_mint`.
+pub fn build_dlmm_swap_from_pool_data(
+    pool_address: Pubkey,
+    pool_data: &[u8],
+    user: Pubkey,
+    user_token_in: Pubkey,
+    user_token_out: Pubkey,
+    input_mint: Pubkey,
+    in_program: Pubkey,
+    out_program: Pubkey,
+    bitmap_ext: Option<Pubkey>,
+    amount_in: u64,
+    min_amount_out: u64,
+) -> Result<Instruction, GenericError> {
+    if pool_data.len() < 216 {
+        return Err(format!(
+            "DLMM pool data too short: {} bytes, need at least 216",
+            pool_data.len()
+        ).into());
+    }
+
+    let active_id = i32::from_le_bytes(pool_data[76..80].try_into().unwrap());
+    let token_x_mint = Pubkey::new_from_array(pool_data[88..120].try_into().unwrap());
+    let token_y_mint = Pubkey::new_from_array(pool_data[120..152].try_into().unwrap());
+    let reserve_x = Pubkey::new_from_array(pool_data[152..184].try_into().unwrap());
+    let reserve_y = Pubkey::new_from_array(pool_data[184..216].try_into().unwrap());
+
+    let bin_array = dlmm_bin_array_pda(&pool_address, active_id);
+
+    // Map caller's in/out programs to the pool's x/y programs based on mint direction.
+    let (token_x_program, token_y_program) = if input_mint == token_x_mint {
+        // Swapping x -> y: in_program owns x, out_program owns y
+        (in_program, out_program)
+    } else if input_mint == token_y_mint {
+        // Swapping y -> x: in_program owns y, out_program owns x
+        (out_program, in_program)
+    } else {
+        return Err(format!(
+            "input_mint {} matches neither token_x {} nor token_y {} in DLMM pool {}",
+            input_mint, token_x_mint, token_y_mint, pool_address
+        ).into());
+    };
+
+    build_dlmm_swap(
+        &DlmmSwapAccounts {
+            pool: pool_address,
+            reserve_x,
+            reserve_y,
+            token_x_mint,
+            token_y_mint,
+            user_token_in,
+            user_token_out,
+            user,
+            token_x_program,
+            token_y_program,
+            bitmap_extension: bitmap_ext,
+            bin_array,
+        },
+        amount_in,
+        min_amount_out,
+    )
+}
+
+/// Build a Raydium CLMM swap instruction from raw on-chain pool account bytes.
+///
+/// The caller reads pool data from an AccountStore (or any source) and passes
+/// the raw bytes here. This avoids coupling the aggregator crate to engine types.
+pub fn build_clmm_swap_from_pool_data(
+    pool_address: Pubkey,
+    pool_data: &[u8],
+    user: Pubkey,
+    user_token_in: Pubkey,
+    user_token_out: Pubkey,
+    input_mint: Pubkey,
+    in_program: Pubkey,
+    out_program: Pubkey,
+    tick_arrays: Vec<Pubkey>,
+    amount_in: u64,
+    min_amount_out: u64,
+) -> Result<Instruction, GenericError> {
+    if pool_data.len() < 233 {
+        return Err(format!(
+            "CLMM pool data too short: {} bytes, need at least 233",
+            pool_data.len()
+        ).into());
+    }
+
+    let amm_config = Pubkey::new_from_array(pool_data[9..41].try_into().unwrap());
+    let token_mint_0 = Pubkey::new_from_array(pool_data[73..105].try_into().unwrap());
+    let token_vault_0 = Pubkey::new_from_array(pool_data[137..169].try_into().unwrap());
+    let token_vault_1 = Pubkey::new_from_array(pool_data[169..201].try_into().unwrap());
+    let observation_key = Pubkey::new_from_array(pool_data[201..233].try_into().unwrap());
+
+    // Determine input/output vaults and mints from swap direction.
+    // token_mint_0 pairs with token_vault_0; the other mint is token_mint_1.
+    let (input_vault, output_vault, output_mint) = if input_mint == token_mint_0 {
+        // Swapping mint_0 -> mint_1
+        let token_mint_1 = if pool_data.len() >= 137 {
+            Pubkey::new_from_array(pool_data[105..137].try_into().unwrap())
+        } else {
+            return Err("CLMM pool data too short to read token_mint_1".into());
+        };
+        (token_vault_0, token_vault_1, token_mint_1)
+    } else {
+        // Swapping mint_1 -> mint_0
+        (token_vault_1, token_vault_0, token_mint_0)
+    };
+
+    // Map in/out programs to input/output token programs.
+    let (input_token_program, output_token_program) = (in_program, out_program);
+
+    build_clmm_swap(
+        &ClmmSwapAccounts {
+            pool: pool_address,
+            amm_config,
+            input_vault,
+            output_vault,
+            observation: observation_key,
+            input_mint,
+            output_mint,
+            user_input_token: user_token_in,
+            user_output_token: user_token_out,
+            user,
+            input_token_program,
+            output_token_program,
+            tick_arrays,
+        },
+        amount_in,
+        min_amount_out,
+        0u128, // sqrt_price_limit = 0 means no limit
+    )
+}

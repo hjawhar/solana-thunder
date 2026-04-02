@@ -13,8 +13,13 @@ members = [
     "crates/meteora-dlmm",
     "crates/pumpfun-amm",
     "crates/aggregator",
+    "crates/engine",
 ]
 exclude = ["crates/router-program"]
+
+[[bin]]
+name = "thunder-engine"
+path = "bin/engine.rs"
 
 [dependencies]
 thunder-core = { path = "crates/core" }
@@ -23,6 +28,13 @@ raydium-clmm = { path = "crates/raydium-clmm" }
 meteora-damm = { path = "crates/meteora-damm" }
 meteora-dlmm = { path = "crates/meteora-dlmm" }
 pumpfun-amm = { path = "crates/pumpfun-amm" }
+thunder-engine = { path = "crates/engine" }
+thunder-aggregator = { path = "crates/aggregator" }
+solana-rpc-client = "3.0"
+solana-commitment-config = "3.0"
+solana-pubkey = { workspace = true }
+tokio = { version = "1", features = ["full"] }
+dotenvy = "0.15"
 
 [dev-dependencies]
 tokio = { version = "1.43.0", features = ["rt-multi-thread", "macros", "time"] }
