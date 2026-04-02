@@ -186,15 +186,18 @@ impl RaydiumClmmMarket {
         // physical_direction is in the pool's raw token ordering.
         // Buy physically: token_0 -> token_1, output = input * raw_price
         // Sell physically: token_1 -> token_0, output = input / raw_price
+        // Cap at available reserves — can't output more than the pool holds.
         let output = match physical_direction {
             SwapDirection::Buy => {
-                (amount_in_with_fee as f64 * raw_price) as u64
+                let raw = (amount_in_with_fee as f64 * raw_price) as u64;
+                raw.min(self.vault_1_balance)
             }
             SwapDirection::Sell => {
                 if raw_price == 0.0 {
                     return Err("Zero price".into());
                 }
-                (amount_in_with_fee as f64 / raw_price) as u64
+                let raw = (amount_in_with_fee as f64 / raw_price) as u64;
+                raw.min(self.vault_0_balance)
             }
         };
 

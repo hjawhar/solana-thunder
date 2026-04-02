@@ -305,9 +305,16 @@ impl MeteoraDAMMV2Market {
             direction
         };
 
+        // Cap at available reserves — can't output more than the pool holds.
         let output = match physical_direction {
-            SwapDirection::Buy => (amount_in_with_fee as f64 / price) as u64,
-            SwapDirection::Sell => (amount_in_with_fee as f64 * price) as u64,
+            SwapDirection::Buy => {
+                let raw = (amount_in_with_fee as f64 / price) as u64;
+                raw.min(self.a_vault_balance)
+            }
+            SwapDirection::Sell => {
+                let raw = (amount_in_with_fee as f64 * price) as u64;
+                raw.min(self.b_vault_balance)
+            }
         };
 
         Ok(output)

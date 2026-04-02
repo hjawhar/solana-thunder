@@ -1,7 +1,7 @@
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use solana_commitment_config::CommitmentConfig;
 use solana_rpc_client::nonblocking::rpc_client::RpcClient;
@@ -57,49 +57,30 @@ async fn main() {
 
     println!("Pool index: {} pools", pool_index.pool_count());
 
-    // 2. Build PoolRegistry from index.
+    // 2. Build PoolRegistry and validate immediately from cached vault balances.
+    //    No RPC needed — the market objects already have balances from the cache.
     let mut registry = PoolRegistry::from_pool_index(&pool_index);
+    registry.validate_from_cache();
     println!(
-        "Registry built: {} pools, {} unique mints",
+        "Registry: {} pools, {} swappable, {} unique mints",
         registry.pool_count(),
+        registry.swappable_count(),
         registry.unique_mints()
     );
 
-    // 3. Cold start: fetch vaults, tick arrays, bitmap extensions, validate.
+    // 3. Build shared state. Server starts serving quotes immediately using
+    //    cached balances. Background task fetches fresh vault data and re-validates.
     let store = Arc::new(AccountStore::new());
-    let rpc = RpcClient::new_with_timeout_and_commitment(
-        rpc_url.clone(),
-        std::time::Duration::from_secs(120),
-        CommitmentConfig::confirmed(),
-    );
-    cold_start::cold_start(&rpc, &mut registry, &store).await;
-
-    // 4. Save cache if loaded from RPC (so next start is faster).
-    if !loaded_from_cache {
-        println!("Saving pool cache to {}", cache_path.display());
-        match cache::save_cache(&pool_index, &cache_path) {
-            Ok(n) => println!("Saved {n} pools to cache"),
-            Err(e) => eprintln!("Cache save failed: {e}"),
-        }
-    }
-
-    // 5. Fetch SOL/USD price.
-    let sol_usd = price::fetch_sol_usd_onchain(&rpc).await;
-    match sol_usd {
-        Some(p) => println!("SOL/USD price: ${p:.2}"),
-        None => eprintln!("Warning: could not fetch SOL/USD price"),
-    }
-
-    // 6. Build shared state.
+    let pool_index = Arc::new(pool_index);
     let state = Arc::new(AppState {
         store: store.clone(),
-        pool_index: Arc::new(pool_index),
+        pool_index: pool_index.clone(),
         registry: Arc::new(RwLock::new(registry)),
-        sol_usd_price: RwLock::new(sol_usd),
+        sol_usd_price: RwLock::new(None),
         start_time: Instant::now(),
     });
 
-    // 7. Start gRPC streaming in background.
+    // 4. Start gRPC streaming in background.
     // start_streaming holds a !Send future (Box<dyn Error> without Send bound),
     // so we run it on a dedicated single-threaded runtime.
     let store_bg = store.clone();
@@ -111,7 +92,77 @@ async fn main() {
         rt.block_on(streaming::start_streaming(store_bg));
     });
 
-    // 8. Start HTTP server.
+    // 5. Background: fetch fresh vault data, auxiliary accounts, re-validate.
+    //    Vault fetching (4M+ accounts) is the only slow phase.
+    let cold_state = state.clone();
+    let cold_rpc_url = rpc_url.clone();
+    tokio::spawn(async move {
+        let rpc = RpcClient::new_with_timeout_and_commitment(
+            cold_rpc_url,
+            std::time::Duration::from_secs(120),
+            CommitmentConfig::confirmed(),
+        );
+
+        println!("[cold_start] starting background vault fetch");
+
+        // Fetch fresh vault balances (slow, read lock only).
+        {
+            let reg = cold_state.registry.read().await;
+            cold_start::fetch_all_vaults(&rpc, &reg, &cold_state.store).await;
+        }
+
+        // Auxiliary accounts + re-validate (fast, write lock).
+        {
+            let mut reg = cold_state.registry.write().await;
+            cold_start::fetch_bitmap_extensions(&rpc, &mut reg, &cold_state.store).await;
+            cold_start::fetch_tick_arrays(&rpc, &mut reg, &cold_state.store).await;
+            cold_start::fetch_dlmm_bin_arrays(&rpc, &mut reg, &cold_state.store).await;
+            reg.validate_all(&cold_state.store);
+
+            println!("[cold_start] === cold start complete ===");
+            println!("[cold_start] total accounts in store: {}", cold_state.store.len());
+            println!(
+                "[cold_start] swappable pools: {}/{}",
+                reg.swappable_count(),
+                reg.pool_count()
+            );
+            for (dex, count) in reg.dex_counts() {
+                let swappable = reg
+                    .iter_pools()
+                    .filter(|(_, info)| info.dex_name == *dex && info.swappable)
+                    .count();
+                println!("[cold_start]   {dex}: {swappable}/{count} swappable");
+            }
+        }
+
+        // Save cache if loaded from RPC.
+        if !loaded_from_cache {
+            println!("Saving pool cache to {}", cache_path.display());
+            match cache::save_cache(&pool_index, &cache_path) {
+                Ok(n) => println!("Saved {n} pools to cache"),
+                Err(e) => eprintln!("Cache save failed: {e}"),
+            }
+        }
+    });
+
+    // 6. SOL/USD price refresh every 15s.
+    let price_state = state.clone();
+    let price_rpc_url = rpc_url.clone();
+    tokio::spawn(async move {
+        let rpc = RpcClient::new_with_timeout_and_commitment(
+            price_rpc_url,
+            Duration::from_secs(10),
+            CommitmentConfig::confirmed(),
+        );
+        loop {
+            if let Some(p) = price::fetch_sol_usd_onchain(&rpc).await {
+                *price_state.sol_usd_price.write().await = Some(p);
+            }
+            tokio::time::sleep(Duration::from_secs(15)).await;
+        }
+    });
+
+    // 7. Start HTTP server (blocks main task).
     let app = api::create_router(state);
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
         .await

@@ -15,7 +15,7 @@ use crate::account_store::AccountStore;
 use crate::pool_registry::PoolRegistry;
 
 const BATCH_SIZE: usize = 100;
-const BATCH_CONCURRENCY: usize = 20;
+const BATCH_CONCURRENCY: usize = 100;
 
 const DLMM_PROGRAM_ID: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
 
@@ -35,6 +35,7 @@ pub async fn fetch_all_vaults(
 
     let chunks: Vec<(usize, &[Pubkey])> = vault_keys.chunks(BATCH_SIZE).enumerate().collect();
     let mut fetched = 0usize;
+    let mut last_print = 0usize;
 
     for window in chunks.chunks(BATCH_CONCURRENCY) {
         let futures: Vec<_> = window
@@ -65,10 +66,11 @@ pub async fn fetch_all_vaults(
             }
         }
 
-        println!(
-            "[cold_start] vaults: {}/{} fetched",
-            fetched, total
-        );
+        // Print progress every ~500k accounts.
+        if fetched - last_print >= 500_000 {
+            println!("[cold_start] vaults: {fetched}/{total}");
+            last_print = fetched;
+        }
     }
 
     println!("[cold_start] vaults done: {fetched}/{total} stored");

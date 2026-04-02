@@ -204,46 +204,38 @@ impl PoolRegistry {
         }
         self.swappable_count.store(count, Ordering::Relaxed);
     }
+
+    /// Initial validation using cached vault balances from the market objects.
+    /// Call immediately after building the registry — no AccountStore needed.
+    /// Re-validate with `validate_all(store)` once fresh vault data arrives.
+    pub fn validate_from_cache(&mut self) {
+        let mut count = 0usize;
+        for info in self.pools.values_mut() {
+            info.swappable = check_swappable_cached(info);
+            if info.swappable {
+                count += 1;
+            }
+        }
+        self.swappable_count.store(count, Ordering::Relaxed);
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Per-DEX swappable validation
 // ---------------------------------------------------------------------------
 
-/// Determine whether a pool is swappable given current on-chain state.
+/// Determine whether a pool can participate in route discovery.
+/// Checks on-chain status and vault liquidity only — NOT auxiliary accounts
+/// (tick arrays, bin arrays, bitmap extensions) which are needed for swap
+/// instruction building but irrelevant for quoting.
 fn check_swappable(info: &PoolInfo, store: &AccountStore) -> bool {
     match info.dex_name.as_str() {
         "Pumpfun AMM" => true,
 
         "Raydium AMM V4" => vaults_funded(info, store),
 
-        // DAMM V1 names include the curve type suffix.
-        s if s.starts_with("Meteora DAMM V1") || s == "Meteora DAMM V2"
-            || s.starts_with("Meteora DAMM (") =>
-        {
-            info.market.is_active() && vaults_funded(info, store)
-        }
-
-        "Raydium CLMM" => {
-            info.market.is_active()
-                && !info.tick_arrays.is_empty()
-                && vaults_funded(info, store)
-        }
-
-        "Meteora DLMM" => {
-            if !info.market.is_active() || !vaults_funded(info, store) {
-                return false;
-            }
-            // Bitmap extension shortcut: if already resolved, pool is reachable.
-            if info.bitmap_ext.is_some() {
-                return true;
-            }
-            // Active bin array must exist in the store.
-            info.bin_array.is_some_and(|pda| store.contains(&pda))
-        }
-
-        // Unknown DEX: be conservative.
-        _ => false,
+        // All remaining DEXs: active + funded vaults.
+        _ => info.market.is_active() && vaults_funded(info, store),
     }
 }
 
@@ -251,4 +243,22 @@ fn check_swappable(info: &PoolInfo, store: &AccountStore) -> bool {
 fn vaults_funded(info: &PoolInfo, store: &AccountStore) -> bool {
     store.read_token_balance(&info.quote_vault) > 0
         && store.read_token_balance(&info.base_vault) > 0
+}
+
+/// Same as `check_swappable` but uses cached vault balances from the market
+/// object instead of the AccountStore. Used during startup before vault data
+/// is fetched from RPC.
+fn check_swappable_cached(info: &PoolInfo) -> bool {
+    match info.dex_name.as_str() {
+        "Pumpfun AMM" => true,
+
+        "Raydium AMM V4" => {
+            info.market.financials().is_ok_and(|f| f.quote_balance > 0 && f.base_balance > 0)
+        }
+
+        _ => {
+            info.market.is_active()
+                && info.market.financials().is_ok_and(|f| f.quote_balance > 0 && f.base_balance > 0)
+        }
+    }
 }

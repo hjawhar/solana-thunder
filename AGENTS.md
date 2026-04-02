@@ -59,7 +59,7 @@ Raw account bytes --BorshDeserialize--> Pool model struct
 ```
 solana-thunder/
 +-- bin/
-|   +-- engine.rs                       # Engine binary entry point
+|   +-- engine.rs                       # Engine binary: immediate serve, background cold start
 +-- Cargo.toml                          # Workspace root
 +-- src/lib.rs                          # Root crate: re-exports all DEX crates
 +-- crates/
@@ -89,8 +89,8 @@ solana-thunder/
 |   |   +-- main.rs                     # CLI binary (thunder-agg)
 |   +-- engine/src/                     # Persistent service (library only, binary in bin/)
 |   |   +-- account_store.rs            # DashMap store for all account data
-|   |   +-- pool_registry.rs            # Pool index + swappable validation (bin_array, tick_arrays, bitmap_ext)
-|   |   +-- cold_start.rs               # Batch-fetch vaults, tick arrays (PDA-based), bin arrays, bitmap exts
+|   |   +-- pool_registry.rs            # Pool index + swappable validation (is_active + vaults_funded, validate_from_cache)
+|   |   +-- cold_start.rs               # Background: vault fetch (100 concurrent), tick arrays, bin arrays, bitmap exts
 |   |   +-- streaming.rs                # Yellowstone gRPC subscriber
 |   |   +-- api.rs                      # Axum HTTP: /quote, /swap, /price, /health
 |   +-- router-program/                 # On-chain CPI router (excluded from workspace)
@@ -181,16 +181,42 @@ solana -u http://127.0.0.1:8899 program deploy \
 
 ### Pool Loading
 
-Fetches ALL pools from all 6 DEXs using `getProgramAccounts` with discriminator + dataSize filters only (no mint filter). ~2M pools total. Vault balances fetched via `getMultipleAccounts` in batches of 100, 20 concurrent.
+Fetches ALL pools from all 6 DEXs using `getProgramAccounts` with discriminator + dataSize filters only (no mint filter). ~2M pools total. Vault balances cached per-pool during loading (used for instant startup validation).
+
+### Engine Startup
+
+The engine starts serving HTTP immediately after cache load (~6s). No blocking vault fetch.
+
+```
+1. Load cache              ~6s   pools.cache -> PoolIndex
+2. validate_from_cache     instant  uses market.financials() (cached vault balances)
+3. Start HTTP server       instant  /quote works immediately
+4. gRPC streaming          background  live account updates
+5. Vault fetch             background  4M+ accounts, 100 concurrent batches
+6. SOL/USD price refresh   background  every 15s
+```
+
+`validate_from_cache()` uses the vault balances already embedded in the deserialized market objects. No RPC calls. Once the background vault fetch completes, `validate_all(store)` re-validates with fresh on-chain data.
 
 ### Cold Start Auxiliary Fetches
 
-After pool loading, the engine cold start fetches auxiliary accounts needed for swappability:
+After vault loading completes in the background, the engine fetches auxiliary accounts needed for swap instruction building (not for quoting):
 
-1. **Vault balances** -- `getMultipleAccounts` for all pool vault token accounts
-2. **DLMM bitmap extensions** -- single GPA for `dataSize=12488` accounts
-3. **CLMM tick arrays** -- PDA-derived from each pool's `tick_array_bitmap`, fetched via `getMultipleAccounts` (top 10k pools by vault balance, ~6 tick arrays each)
-4. **DLMM bin arrays** -- PDA-derived from each pool's `active_id`, fetched via `getMultipleAccounts`
+1. **DLMM bitmap extensions** -- single GPA for `dataSize=12488` accounts
+2. **CLMM tick arrays** -- PDA-derived from each pool's `tick_array_bitmap`, fetched via `getMultipleAccounts` (top 10k pools by vault balance, ~6 tick arrays each)
+3. **DLMM bin arrays** -- PDA-derived from each pool's `active_id`, fetched via `getMultipleAccounts`
+
+### Swappable Validation
+
+Route discovery only gates on pool status and liquidity -- NOT auxiliary accounts:
+
+| DEX | Swappable when |
+|---|---|
+| Pumpfun AMM | always (no status field) |
+| Raydium AMM V4 | vaults funded |
+| All others | `is_active()` AND vaults funded |
+
+`calculate_output()` uses pool struct fields (sqrt_price, active_id, tick_current) which are in the deserialized pool data. Tick arrays, bin arrays, and bitmap extensions are only needed for building on-chain swap instructions, not for computing quotes.
 
 ### Pool Cache
 
@@ -276,10 +302,10 @@ let ix = swap_builder::build_clmm_swap(&ClmmSwapAccounts { ... }, amount, min_ou
 
 | File | What it is |
 |---|---|
-| `bin/engine.rs` | Engine binary entry point (startup, env parsing) |
+| `bin/engine.rs` | Engine binary: instant startup, background vault fetch, 15s SOL/USD refresh |
 | `crates/engine/src/account_store.rs` | DashMap store for all account data (pools, vaults, tick arrays) |
-| `crates/engine/src/pool_registry.rs` | Pool index + per-DEX swappable validation (`bin_array`, `tick_arrays`, `bitmap_ext` fields) |
-| `crates/engine/src/cold_start.rs` | Batch-fetch vaults, tick arrays (PDA-derived), bin arrays, bitmap extensions |
+| `crates/engine/src/pool_registry.rs` | Pool index + swappable validation (`validate_from_cache`, `validate_all`) |
+| `crates/engine/src/cold_start.rs` | Background: vault fetch (100 concurrent), tick arrays (PDA-derived), bin arrays, bitmap exts |
 | `crates/engine/src/streaming.rs` | Yellowstone gRPC subscriber for live account updates |
 | `crates/engine/src/api.rs` | Axum HTTP: /quote (<50ms), /swap, /price (<5ms), /health |
 | `crates/aggregator/src/swap_builder.rs` | Swap instructions for all 6 DEXs (+ from_pool_data variants) |

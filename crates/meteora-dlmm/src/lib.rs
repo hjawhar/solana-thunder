@@ -178,14 +178,17 @@ impl MeteoraDlmmMarket {
             direction
         };
 
+        // Cap at available reserves — can't output more than the pool holds.
         let output = match effective_direction {
             SwapDirection::Buy => {
-                // Y → X (SOL → Token): output ≈ amount_in / price
-                (amount_in_with_fee as f64 / price) as u64
+                // Y → X: output ≈ amount_in / price, capped at reserve_x.
+                let raw = (amount_in_with_fee as f64 / price) as u64;
+                raw.min(self.reserve_x_balance)
             }
             SwapDirection::Sell => {
-                // X → Y (Token → SOL): output ≈ amount_in * price
-                (amount_in_with_fee as f64 * price) as u64
+                // X → Y: output ≈ amount_in * price, capped at reserve_y.
+                let raw = (amount_in_with_fee as f64 * price) as u64;
+                raw.min(self.reserve_y_balance)
             }
         };
 
