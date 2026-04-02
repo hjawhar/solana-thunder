@@ -14,6 +14,9 @@ use thunder_core::Market;
 pub struct PoolEntry {
     pub market: Box<dyn Market>,
     pub dex_name: String,
+    /// Pre-resolved mints from metadata for fast direction lookup in routing.
+    pub quote_mint: Pubkey,
+    pub base_mint: Pubkey,
     /// Serialized pool data for disk cache (bincode of CachedPool variant).
     pub cached_data: Vec<u8>,
 }

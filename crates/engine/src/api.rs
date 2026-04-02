@@ -56,6 +56,7 @@ struct QuoteParams {
     output_mint: String,
     amount: u64,
     slippage_bps: Option<u64>,
+    max_hops: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -104,17 +105,15 @@ async fn handle_quote(
     let input_mint = parse_mint(&params.input_mint).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let output_mint = parse_mint(&params.output_mint).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let slippage_bps = params.slippage_bps.unwrap_or(50);
+    let max_hops = params.max_hops.unwrap_or(2).min(4);
 
     let start = Instant::now();
 
-    // Build swappable set BEFORE routing so the router only considers
-    // executable pools. Without this, the top-N routes might all go through
-    // non-swappable pools and get discarded by post-filtering, hiding viable routes.
     let swappable = state.registry.read().await.swappable_set();
-    let router = Router::new(&state.pool_index, 4)
+    let router = Router::new(&state.pool_index, max_hops)
         .with_swappable_set(swappable);
     let quote = router
-        .find_routes(input_mint, output_mint, params.amount, 10)
+        .find_routes(input_mint, output_mint, params.amount, 5)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("routing error: {e}")))?;
 
     let routes: Vec<RouteJson> = quote

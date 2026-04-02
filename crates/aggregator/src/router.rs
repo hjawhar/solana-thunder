@@ -5,6 +5,7 @@
 //! the actual input amount, then ranked by output amount descending.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use solana_pubkey::Pubkey;
 use thunder_core::{GenericError, SwapDirection, JITOSOL, MSOL, USDC, USDT, WSOL};
@@ -19,18 +20,15 @@ const HUB_MINTS: [&str; 5] = [WSOL, USDC, USDT, JITOSOL, MSOL];
 const HUB_MINTS_CORE: [&str; 3] = [WSOL, USDC, USDT];
 
 /// Max neighbors explored per side in bidirectional search.
-const MAX_NEIGHBOR_CANDIDATES: usize = 200;
+const MAX_NEIGHBOR_CANDIDATES: usize = 50;
 
 /// Minimum vault balance (raw units) for a pool to be routable.
 const MIN_VAULT_BALANCE: u64 = 10_000_000; // 0.01 SOL
 
-/// Maximum acceptable price impact (bps) for a single hop.
-const MAX_HOP_IMPACT_BPS: u64 = 5000; // 50%
-
 pub struct Router<'a> {
     index: &'a PoolIndex,
     max_hops: usize,
-    swappable_set: Option<HashSet<String>>,
+    swappable_set: Option<Arc<HashSet<String>>>,
 }
 
 impl<'a> Router<'a> {
@@ -43,8 +41,7 @@ impl<'a> Router<'a> {
     }
 
     /// Restrict routing to only the given pool addresses.
-    /// Pools not in the set are skipped during simulation.
-    pub fn with_swappable_set(mut self, set: HashSet<String>) -> Self {
+    pub fn with_swappable_set(mut self, set: Arc<HashSet<String>>) -> Self {
         self.swappable_set = Some(set);
         self
     }
@@ -149,7 +146,7 @@ impl<'a> Router<'a> {
         out: &mut Vec<Route>,
     ) {
         for addr in self.index.direct_pools(input, output) {
-            if let Some(route) = simulate_path(self.index, &[(addr, *input, *output)], amount_in, self.swappable_set.as_ref()) {
+            if let Some(route) = simulate_path(self.index, &[(addr, *input, *output)], amount_in, self.swappable_set.as_deref()) {
                 out.push(route);
             }
         }
@@ -171,15 +168,15 @@ impl<'a> Router<'a> {
         }
 
         // Try top N pools per leg to find viable routes (not just the single best).
-        let top_leg1 = top_pools(self.index, &leg1, *input, amount_in, 3, self.swappable_set.as_ref());
+        let top_leg1 = top_pools(self.index, &leg1, *input, amount_in, 3, self.swappable_set.as_deref());
         for (a1, mid_amount) in &top_leg1 {
-            let top_leg2 = top_pools(self.index, &leg2, *mid, *mid_amount, 3, self.swappable_set.as_ref());
+            let top_leg2 = top_pools(self.index, &leg2, *mid, *mid_amount, 3, self.swappable_set.as_deref());
             for (a2, _) in &top_leg2 {
                 if let Some(route) = simulate_path(
                     self.index,
                     &[(a1.clone(), *input, *mid), (a2.clone(), *mid, *output)],
                     amount_in,
-                    self.swappable_set.as_ref(),
+                    self.swappable_set.as_deref(),
                 ) {
                     out.push(route);
                 }
@@ -213,7 +210,7 @@ impl<'a> Router<'a> {
                 continue;
             }
 
-            let Some(hop1) = simulate_hop(self.index, pool_addr, *input, amount_in, self.swappable_set.as_ref()) else {
+            let Some(hop1) = simulate_hop(self.index, pool_addr, *input, amount_in, self.swappable_set.as_deref()) else {
                 tried += 1;
                 continue;
             };
@@ -222,7 +219,7 @@ impl<'a> Router<'a> {
                 continue;
             }
 
-            let Some((a2, _)) = best_pool(self.index, &leg2, *mid, hop1.output_amount, self.swappable_set.as_ref()) else {
+            let Some((a2, _)) = best_pool(self.index, &leg2, *mid, hop1.output_amount, self.swappable_set.as_deref()) else {
                 tried += 1;
                 continue;
             };
@@ -231,7 +228,7 @@ impl<'a> Router<'a> {
                 self.index,
                 &[(pool_addr.clone(), *input, *mid), (a2, *mid, *output)],
                 amount_in,
-                self.swappable_set.as_ref(),
+                self.swappable_set.as_deref(),
             ) {
                 out.push(route);
             }
@@ -268,13 +265,13 @@ impl<'a> Router<'a> {
             }
 
             // Simulate: input → mid (best pool) → output (best pool)
-            let Some((a1, mid_amount)) = best_pool(self.index, &leg1, *input, amount_in, self.swappable_set.as_ref()) else {
+            let Some((a1, mid_amount)) = best_pool(self.index, &leg1, *input, amount_in, self.swappable_set.as_deref()) else {
                 tried += 1;
                 continue;
             };
 
             let leg2 = self.index.direct_pools(mid, output);
-            let Some((a2, _)) = best_pool(self.index, &leg2, *mid, mid_amount, self.swappable_set.as_ref()) else {
+            let Some((a2, _)) = best_pool(self.index, &leg2, *mid, mid_amount, self.swappable_set.as_deref()) else {
                 tried += 1;
                 continue;
             };
@@ -283,7 +280,7 @@ impl<'a> Router<'a> {
                 self.index,
                 &[(a1, *input, *mid), (a2, *mid, *output)],
                 amount_in,
-                self.swappable_set.as_ref(),
+                self.swappable_set.as_deref(),
             ) {
                 out.push(route);
             }
@@ -309,15 +306,15 @@ impl<'a> Router<'a> {
             return;
         }
 
-        let Some((a1, amt1)) = best_pool(self.index, &l1, *input, amount_in, self.swappable_set.as_ref()) else { return };
-        let Some((a2, amt2)) = best_pool(self.index, &l2, *h1, amt1, self.swappable_set.as_ref()) else { return };
-        let Some((a3, _)) = best_pool(self.index, &l3, *h2, amt2, self.swappable_set.as_ref()) else { return };
+        let Some((a1, amt1)) = best_pool(self.index, &l1, *input, amount_in, self.swappable_set.as_deref()) else { return };
+        let Some((a2, amt2)) = best_pool(self.index, &l2, *h1, amt1, self.swappable_set.as_deref()) else { return };
+        let Some((a3, _)) = best_pool(self.index, &l3, *h2, amt2, self.swappable_set.as_deref()) else { return };
 
         if let Some(route) = simulate_path(
             self.index,
             &[(a1, *input, *h1), (a2, *h1, *h2), (a3, *h2, *output)],
             amount_in,
-            self.swappable_set.as_ref(),
+            self.swappable_set.as_deref(),
         ) {
             out.push(route);
         }
@@ -417,17 +414,17 @@ impl<'a> Router<'a> {
                         continue;
                     }
 
-                    let Some((a1, amt1)) = best_pool(self.index, &l1, *input, amount_in, self.swappable_set.as_ref())
+                    let Some((a1, amt1)) = best_pool(self.index, &l1, *input, amount_in, self.swappable_set.as_deref())
                     else {
                         continue;
                     };
-                    let Some((a2, amt2)) = best_pool(self.index, &l2, *n_in, amt1, self.swappable_set.as_ref()) else {
+                    let Some((a2, amt2)) = best_pool(self.index, &l2, *n_in, amt1, self.swappable_set.as_deref()) else {
                         continue;
                     };
-                    let Some((a3, amt3)) = best_pool(self.index, &l3, *hub, amt2, self.swappable_set.as_ref()) else {
+                    let Some((a3, amt3)) = best_pool(self.index, &l3, *hub, amt2, self.swappable_set.as_deref()) else {
                         continue;
                     };
-                    let Some((a4, _)) = best_pool(self.index, &l4, *n_out, amt3, self.swappable_set.as_ref()) else {
+                    let Some((a4, _)) = best_pool(self.index, &l4, *n_out, amt3, self.swappable_set.as_deref()) else {
                         continue;
                     };
 
@@ -440,7 +437,7 @@ impl<'a> Router<'a> {
                             (a4, *n_out, *output),
                         ],
                         amount_in,
-                        self.swappable_set.as_ref(),
+                        self.swappable_set.as_deref(),
                     ) {
                         out.push(route);
                     }
@@ -454,7 +451,8 @@ impl<'a> Router<'a> {
 // Simulation helpers
 // =============================================================================
 
-/// Simulate a single hop: determine direction from pool metadata, compute output.
+/// Simulate a single hop: determine direction from pre-resolved mints, compute output.
+/// Avoids metadata() allocation entirely — direction comes from PoolEntry.quote_mint/base_mint.
 fn simulate_hop(
     index: &PoolIndex,
     pool_address: &str,
@@ -462,7 +460,6 @@ fn simulate_hop(
     amount_in: u64,
     swappable: Option<&HashSet<String>>,
 ) -> Option<RouteHop> {
-    // Skip pools not in the swappable set (if filtering is active).
     if let Some(set) = swappable {
         if !set.contains(pool_address) {
             return None;
@@ -470,24 +467,24 @@ fn simulate_hop(
     }
 
     let entry = index.get_pool(pool_address)?;
-    let meta = entry.market.metadata().ok()?;
 
-    // Skip inactive pools (status field check per DEX).
-    if !entry.market.is_active() {
-        return None;
-    }
-
-    // Skip pools with negligible liquidity.
-    if let Ok(fin) = entry.market.financials() {
-        if fin.quote_balance < MIN_VAULT_BALANCE && fin.base_balance < MIN_VAULT_BALANCE {
+    // When no swappable set, fall back to per-hop checks.
+    if swappable.is_none() {
+        if !entry.market.is_active() {
             return None;
+        }
+        if let Ok(fin) = entry.market.financials() {
+            if fin.quote_balance < MIN_VAULT_BALANCE && fin.base_balance < MIN_VAULT_BALANCE {
+                return None;
+            }
         }
     }
 
-    let (direction, output_mint) = if input_mint == meta.quote_mint {
-        (SwapDirection::Buy, meta.base_mint)
-    } else if input_mint == meta.base_mint {
-        (SwapDirection::Sell, meta.quote_mint)
+    // Direction from pre-resolved mints — no metadata() call needed.
+    let (direction, output_mint) = if input_mint == entry.quote_mint {
+        (SwapDirection::Buy, entry.base_mint)
+    } else if input_mint == entry.base_mint {
+        (SwapDirection::Sell, entry.quote_mint)
     } else {
         return None;
     };
@@ -502,15 +499,6 @@ fn simulate_hop(
         return None;
     }
 
-    let price_impact_bps = entry
-        .market
-        .calculate_price_impact(amount_in, direction)
-        .unwrap_or(0);
-
-    if price_impact_bps > MAX_HOP_IMPACT_BPS {
-        return None;
-    }
-
     Some(RouteHop {
         pool_address: pool_address.to_string(),
         dex_name: entry.dex_name.clone(),
@@ -518,7 +506,7 @@ fn simulate_hop(
         output_mint,
         input_amount: amount_in,
         output_amount,
-        price_impact_bps,
+        price_impact_bps: 0,
     })
 }
 

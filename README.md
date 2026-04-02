@@ -5,15 +5,16 @@ A Rust DEX aggregator for Solana. Loads all pools across 6 DEX protocols, finds 
 ## Features
 
 - **2M+ pools loaded** across 6 DEXs (Raydium V4, Raydium CLMM, Meteora DAMM V1/V2, Meteora DLMM, Pumpfun AMM)
-- **Multi-hop routing** (1-4 hops) with bidirectional neighbor search
+- **Multi-hop routing** (1-4 hops, default 2) with hub-based and bidirectional neighbor search
 - **On-chain SOL/USD pricing** from Raydium CLMM `sqrt_price_x64` -- no external APIs
 - **Centralized swap instruction builder** for all DEXs with correct Anchor account layouts
 - **Surfpool integration** -- execute real swaps against forked mainnet state, zero cost
 - **On-chain router program** with exact amount chaining and slippage protection
-- **Parallel pre-fetching** -- CLMM tick arrays and DLMM bitmap extensions fetched in parallel
-- **Route pre-filtering** -- skips routes through pools missing required accounts before trying
+- **Instant startup** -- serves quotes immediately from cached vault balances, fresh data loads in background
+- **Optimized routing** -- pre-resolved mints, cached swappable set (Arc<HashSet>), no allocations in hot path
+- **Reserve-capped outputs** -- calculate_output never exceeds pool vault balance
 - **Disk cache** -- first load ~4 min from RPC, subsequent loads ~6s from cache
-- **Swap execution in ~40-60s** -- find route, build instructions, execute on Surfpool
+- **SOL/USD price refresh** -- on-chain price from CLMM sqrt_price, refreshed every 15s
 - **Interactive CLI** with progress bars and REPL
 - **Pure DEX library** -- each DEX crate has zero I/O, usable independently
 
@@ -43,7 +44,7 @@ RPC_URL="https://your-rpc-endpoint.com" cargo run --release --bin thunder-engine
 # In another terminal:
 curl "http://localhost:8080/health"
 curl "http://localhost:8080/price?mint=SOL"
-curl "http://localhost:8080/quote?inputMint=SOL&outputMint=6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN&amount=100000000"
+curl "http://localhost:8080/quote?inputMint=SOL&outputMint=6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN&amount=100000000&maxHops=2"
 ```
 
 ### Run the Aggregator CLI
@@ -141,6 +142,17 @@ thunder-router            On-chain program for CPI multi-hop swaps (Surfpool)
 solana-thunder            Root crate: re-exports all DEX crates
 ```
 
+### Engine Startup
+
+```
+1. Load cache              ~6s   pools.cache -> PoolIndex
+2. validate_from_cache     instant  cached vault balances -> swappable set
+3. Start HTTP server       instant  /quote works immediately
+4. gRPC streaming          background  live account updates
+5. Vault fetch             background  4M+ accounts, 100 concurrent batches
+6. SOL/USD price refresh   background  every 15s
+```
+
 ### Engine Service Flow
 
 ```
@@ -148,15 +160,15 @@ Yellowstone gRPC  --->  AccountStore (DashMap, all accounts in memory)
                               |
 RPC cold start  ------------>|  vaults, tick arrays, bitmap extensions
                               v
-                        PoolRegistry (2M pools, swappable flags)
+                        PoolRegistry (2M pools, cached Arc<HashSet> swappable set)
                               |
                               v
-                    Router (BFS, 1-4 hops, swappable-only)
+                    Router (1-4 hops, pre-resolved mints, no metadata() alloc)
                               |
                               v
-                    HTTP API:  GET /quote (<50ms)
-                               POST /swap (<10ms)
-                               GET /price (<5ms)
+                    HTTP API:  GET /quote  (?maxHops=2&slippageBps=50)
+                               POST /swap
+                               GET /price
 ```
 
 ### Project Structure
@@ -175,8 +187,8 @@ solana-thunder/
 |   +-- aggregator/                   Pool loading, routing, swap building, caching, CLI
 |   |   +-- src/
 |   |       +-- loader.rs             RPC pool loading (all DEXs, no mint filter)
-|   |       +-- cache.rs              Disk cache (~1.6 GB for 2M pools)
-|   |       +-- router.rs             Multi-hop routing (1-4 hops, swappable filter)
+|   |       +-- cache.rs              Disk cache + PDA extraction + make_entry helper
+|   |       +-- router.rs             Multi-hop routing (pre-resolved mints, cached swappable set)
 |   |       +-- swap_builder.rs       Swap instructions for all 6 DEXs
 |   |       +-- price.rs              On-chain pricing (CLMM sqrt_price)
 |   |       +-- pool_index.rs         In-memory token-pair graph
@@ -184,8 +196,8 @@ solana-thunder/
 |   +-- engine/                       Persistent service (library)
 |   |   +-- src/
 |   |       +-- account_store.rs      DashMap store for all account data
-|   |       +-- pool_registry.rs      Pool index + swappable validation
-|   |       +-- cold_start.rs         Batch-fetch vaults, tick arrays, bitmap exts
+|   |       +-- pool_registry.rs      Swappable validation (cached Arc<HashSet>, validate_from_cache)
+|   |       +-- cold_start.rs         Background vault fetch (100 concurrent), tick arrays, bin arrays
 |   |       +-- streaming.rs          Yellowstone gRPC subscriber
 |   |       +-- api.rs                Axum HTTP: /quote, /swap, /price, /health
 |   +-- router-program/               On-chain CPI router (Surfpool)

@@ -9,7 +9,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use thunder_core::GenericError;
+use thunder_core::{GenericError, Market};
 
 use meteora_damm::{MeteoraDAMMMarket, MeteoraDAMMPool, MeteoraDAMMV2Market, MeteoraDAMMV2Pool};
 use meteora_dlmm::{MeteoraDlmmMarket, MeteoraDLMMPool};
@@ -38,63 +38,74 @@ impl CachedPool {
     pub fn into_pool_entry(self) -> (String, PoolEntry) {
         match self {
             Self::RaydiumV4 { addr, pool, quote_bal, base_bal } => {
-                let dex = "Raydium AMM V4";
                 let cached = bincode::serialize(&Self::RaydiumV4 {
                     addr: addr.clone(), pool: pool.clone(), quote_bal, base_bal,
                 }).unwrap_or_default();
                 let market = RaydiumAmmV4Market::new(pool, addr.clone(), quote_bal, base_bal);
-                (addr, PoolEntry { market: Box::new(market), dex_name: dex.into(), cached_data: cached })
+                make_entry(addr, "Raydium AMM V4", market, cached)
             }
             Self::RaydiumClmm { addr, pool, v0_bal, v1_bal } => {
-                let dex = "Raydium CLMM";
                 let cached = bincode::serialize(&Self::RaydiumClmm {
                     addr: addr.clone(), pool: pool.clone(), v0_bal, v1_bal,
                 }).unwrap_or_default();
                 let mut market = RaydiumClmmMarket::new(pool, addr.clone());
                 market.vault_0_balance = v0_bal;
                 market.vault_1_balance = v1_bal;
-                (addr, PoolEntry { market: Box::new(market), dex_name: dex.into(), cached_data: cached })
+                make_entry(addr, "Raydium CLMM", market, cached)
             }
             Self::MeteoraDAMMV1 { addr, pool, a_bal, b_bal } => {
-                let dex = "Meteora DAMM V1";
                 let cached = bincode::serialize(&Self::MeteoraDAMMV1 {
                     addr: addr.clone(), pool: pool.clone(), a_bal, b_bal,
                 }).unwrap_or_default();
                 let mut market = MeteoraDAMMMarket::new(pool, addr.clone());
                 market.a_vault_balance = a_bal;
                 market.b_vault_balance = b_bal;
-                (addr, PoolEntry { market: Box::new(market), dex_name: dex.into(), cached_data: cached })
+                make_entry(addr, "Meteora DAMM V1", market, cached)
             }
             Self::MeteoraDAMMV2 { addr, pool, a_bal, b_bal } => {
-                let dex = "Meteora DAMM V2";
                 let cached = bincode::serialize(&Self::MeteoraDAMMV2 {
                     addr: addr.clone(), pool: pool.clone(), a_bal, b_bal,
                 }).unwrap_or_default();
                 let mut market = MeteoraDAMMV2Market::new(pool, addr.clone());
                 market.a_vault_balance = a_bal;
                 market.b_vault_balance = b_bal;
-                (addr, PoolEntry { market: Box::new(market), dex_name: dex.into(), cached_data: cached })
+                make_entry(addr, "Meteora DAMM V2", market, cached)
             }
             Self::MeteoraDLMM { addr, pool, rx_bal, ry_bal } => {
-                let dex = "Meteora DLMM";
                 let cached = bincode::serialize(&Self::MeteoraDLMM {
                     addr: addr.clone(), pool: pool.clone(), rx_bal, ry_bal,
                 }).unwrap_or_default();
                 let mut market = MeteoraDlmmMarket::new(pool, addr.clone());
                 market.reserve_x_balance = rx_bal;
                 market.reserve_y_balance = ry_bal;
-                (addr, PoolEntry { market: Box::new(market), dex_name: dex.into(), cached_data: cached })
+                make_entry(addr, "Meteora DLMM", market, cached)
             }
             Self::PumpfunAmm { addr, pool } => {
-                let dex = "Pumpfun AMM";
                 let cached = bincode::serialize(&Self::PumpfunAmm {
                     addr: addr.clone(), pool: pool.clone(),
                 }).unwrap_or_default();
                 let market = PumpfunAmmMarket::new(pool, addr.clone());
-                (addr, PoolEntry { market: Box::new(market), dex_name: dex.into(), cached_data: cached })
+                make_entry(addr, "Pumpfun AMM", market, cached)
             }
         }
     }
+}
+
+/// Build a PoolEntry, resolving quote/base mints from market metadata once.
+fn make_entry(
+    addr: String,
+    dex: &str,
+    market: impl Market + 'static,
+    cached_data: Vec<u8>,
+) -> (String, PoolEntry) {
+    let meta = market.metadata().unwrap();
+    (addr, PoolEntry {
+        quote_mint: meta.quote_mint,
+        base_mint: meta.base_mint,
+        market: Box::new(market),
+        dex_name: dex.into(),
+        cached_data,
+    })
 }
 
 // ---------------------------------------------------------------------------

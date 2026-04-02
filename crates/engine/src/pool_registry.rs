@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use solana_pubkey::Pubkey;
@@ -36,6 +37,8 @@ pub struct PoolRegistry {
     edges: HashMap<Pubkey, Vec<(Pubkey, String)>>,
     dex_counts: HashMap<String, usize>,
     swappable_count: AtomicUsize,
+    /// Pre-built set, rebuilt during validate_from_cache / validate_all.
+    cached_swappable: Arc<HashSet<String>>,
 }
 
 impl PoolRegistry {
@@ -45,6 +48,7 @@ impl PoolRegistry {
             edges: HashMap::new(),
             dex_counts: HashMap::new(),
             swappable_count: AtomicUsize::new(0),
+            cached_swappable: Arc::new(HashSet::new()),
         }
     }
 
@@ -68,6 +72,7 @@ impl PoolRegistry {
             };
             let (address, owned_entry) = cached.into_pool_entry();
 
+            // Vault addresses still need metadata (not on PoolEntry).
             let meta = match owned_entry.market.metadata() {
                 Ok(m) => m,
                 Err(_) => continue,
@@ -78,8 +83,8 @@ impl PoolRegistry {
                 dex_name: owned_entry.dex_name,
                 market: owned_entry.market,
                 swappable: false,
-                quote_mint: meta.quote_mint,
-                base_mint: meta.base_mint,
+                quote_mint: owned_entry.quote_mint,
+                base_mint: owned_entry.base_mint,
                 quote_vault: meta.quote_vault,
                 base_vault: meta.base_vault,
                 tick_arrays: Vec::new(),
@@ -164,13 +169,9 @@ impl PoolRegistry {
         self.pools.iter().map(|(k, v)| (k.as_str(), v))
     }
 
-    /// Set of all pool addresses where swappable is true.
-    pub fn swappable_set(&self) -> HashSet<String> {
-        self.pools
-            .iter()
-            .filter(|(_, info)| info.swappable)
-            .map(|(addr, _)| addr.clone())
-            .collect()
+    /// Cached swappable set -- rebuilt during validation, O(1) to retrieve.
+    pub fn swappable_set(&self) -> Arc<HashSet<String>> {
+        self.cached_swappable.clone()
     }
 
     /// Validate a single pool's swappable status against on-chain account data.
@@ -193,30 +194,34 @@ impl PoolRegistry {
         }
     }
 
-    /// Validate all pools against the account store and recompute swappable_count.
+    /// Validate all pools against the account store and recompute swappable set.
     pub fn validate_all(&mut self, store: &AccountStore) {
         let mut count = 0usize;
-        for info in self.pools.values_mut() {
+        let mut set = HashSet::with_capacity(self.pools.len() / 2);
+        for (addr, info) in self.pools.iter_mut() {
             info.swappable = check_swappable(info, store);
             if info.swappable {
+                set.insert(addr.clone());
                 count += 1;
             }
         }
         self.swappable_count.store(count, Ordering::Relaxed);
+        self.cached_swappable = Arc::new(set);
     }
 
     /// Initial validation using cached vault balances from the market objects.
-    /// Call immediately after building the registry — no AccountStore needed.
-    /// Re-validate with `validate_all(store)` once fresh vault data arrives.
     pub fn validate_from_cache(&mut self) {
         let mut count = 0usize;
-        for info in self.pools.values_mut() {
+        let mut set = HashSet::with_capacity(self.pools.len() / 2);
+        for (addr, info) in self.pools.iter_mut() {
             info.swappable = check_swappable_cached(info);
             if info.swappable {
+                set.insert(addr.clone());
                 count += 1;
             }
         }
         self.swappable_count.store(count, Ordering::Relaxed);
+        self.cached_swappable = Arc::new(set);
     }
 }
 

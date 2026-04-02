@@ -81,7 +81,7 @@ solana-thunder/
 |   +-- aggregator/src/                 # Pool loading, routing, swap building, caching, CLI
 |   |   +-- loader.rs                   # Async RPC pool loading (all DEXs, no mint filter)
 |   |   +-- cache.rs                    # Disk cache + PDA extraction (extract_clmm_tick_pdas, extract_dlmm_bin_pda)
-|   |   +-- router.rs                   # Multi-hop routing (1-4 hops, swappable filter)
+|   |   +-- router.rs                   # Multi-hop routing (1-2 hops default, maxHops param, cached swappable set)
 |   |   +-- swap_builder.rs             # Swap instructions for all 6 DEXs
 |   |   +-- price.rs                    # SOL/USD on-chain via CLMM sqrt_price
 |   |   +-- pool_index.rs               # In-memory token-pair graph
@@ -120,7 +120,7 @@ RPC_URL="https://..." cargo run --release -p thunder-aggregator
 
 # Engine API
 curl http://localhost:8080/health
-curl "http://localhost:8080/quote?inputMint=SOL&outputMint=6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN&amount=100000000"
+curl "http://localhost:8080/quote?inputMint=SOL&outputMint=6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN&amount=100000000&maxHops=2"
 curl "http://localhost:8080/price?mint=SOL"
 
 # Surfpool swap test
@@ -304,12 +304,12 @@ let ix = swap_builder::build_clmm_swap(&ClmmSwapAccounts { ... }, amount, min_ou
 |---|---|
 | `bin/engine.rs` | Engine binary: instant startup, background vault fetch, 15s SOL/USD refresh |
 | `crates/engine/src/account_store.rs` | DashMap store for all account data (pools, vaults, tick arrays) |
-| `crates/engine/src/pool_registry.rs` | Pool index + swappable validation (`validate_from_cache`, `validate_all`) |
+| `crates/engine/src/pool_registry.rs` | Pool index + swappable validation (cached `Arc<HashSet>`, `validate_from_cache`) |
 | `crates/engine/src/cold_start.rs` | Background: vault fetch (100 concurrent), tick arrays (PDA-derived), bin arrays, bitmap exts |
 | `crates/engine/src/streaming.rs` | Yellowstone gRPC subscriber for live account updates |
-| `crates/engine/src/api.rs` | Axum HTTP: /quote (<50ms), /swap, /price (<5ms), /health |
+| `crates/engine/src/api.rs` | Axum HTTP: /quote (<400ms target), /swap, /price, /health |
 | `crates/aggregator/src/swap_builder.rs` | Swap instructions for all 6 DEXs (+ from_pool_data variants) |
-| `crates/aggregator/src/router.rs` | Multi-hop routing (1-4 hops, swappable filter) |
+| `crates/aggregator/src/router.rs` | Multi-hop routing (1-4 hops, pre-resolved mints, no metadata() in hot path) |
 | `crates/aggregator/src/loader.rs` | RPC pool loading (discriminator + dataSize filters) |
 | `crates/aggregator/src/cache.rs` | Disk cache + PDA extraction helpers (`extract_clmm_tick_pdas`, `extract_dlmm_bin_pda`) |
 | `crates/core/src/traits.rs` | Market trait, PoolMetadata, PoolFinancials, is_active() |

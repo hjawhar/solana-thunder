@@ -36,24 +36,22 @@ impl PoolIndex {
         }
     }
 
-    /// Insert a pool into the index. Extracts mint pair from pool metadata
-    /// and adds bidirectional edges in the token graph.
+    /// Insert a pool into the index. Uses pre-resolved mints from the entry
+    /// to build bidirectional edges in the token graph.
     pub fn add_pool(&mut self, address: String, entry: PoolEntry) -> Result<(), GenericError> {
-        let meta = entry.market.metadata()?;
-
         // Bidirectional edges: quote_mint <-> base_mint via this pool.
         self.edges
-            .entry(meta.quote_mint)
+            .entry(entry.quote_mint)
             .or_default()
             .push(Edge {
-                other_mint: meta.base_mint,
+                other_mint: entry.base_mint,
                 pool_address: address.clone(),
             });
         self.edges
-            .entry(meta.base_mint)
+            .entry(entry.base_mint)
             .or_default()
             .push(Edge {
-                other_mint: meta.quote_mint,
+                other_mint: entry.quote_mint,
                 pool_address: address.clone(),
             });
 
