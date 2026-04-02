@@ -263,6 +263,67 @@ impl Market for MeteoraDlmmMarket {
         self.calculate_dlmm_output(amount_in, direction)
     }
 
+    fn calculate_output_live(
+        &self,
+        amount_in: u64,
+        direction: SwapDirection,
+        pool_data: Option<&[u8]>,
+        quote_vault_balance: u64,
+        base_vault_balance: u64,
+    ) -> Result<u64, GenericError> {
+        let pool_data = match pool_data {
+            Some(d) if d.len() >= 80 => d,
+            _ => return self.calculate_dlmm_output(amount_in, direction),
+        };
+
+        // Parse live active_id (i32 at account offset 76, after 8-byte discriminator).
+        let active_id = i32::from_le_bytes(
+            pool_data[76..80].try_into().unwrap(),
+        );
+
+        let bin_step = self.pool.bin_step as f64;
+        let base = 1.0 + (bin_step / 10000.0);
+        let price = base.powi(active_id);
+
+        // Fee = base_factor * bin_step / 10_000 (in bps).
+        let fee_bps = (self.pool.parameters.base_factor as u64 * self.pool.bin_step as u64) / 10_000;
+        let fee_multiplier = 10000 - fee_bps;
+        let amount_in_with_fee = (amount_in as u128 * fee_multiplier as u128) / 10000;
+
+        // Reconstruct reserve balances from caller-provided vault balances.
+        // Caller already flipped if needed: quote=quote, base=base in normalized orientation.
+        // DLMM: token_x = base, token_y = quote (when !flipped).
+        let (reserve_x_balance, reserve_y_balance) = if self.flipped {
+            (quote_vault_balance, base_vault_balance)
+        } else {
+            (base_vault_balance, quote_vault_balance)
+        };
+
+        let effective_direction = if self.flipped {
+            match direction {
+                SwapDirection::Buy => SwapDirection::Sell,
+                SwapDirection::Sell => SwapDirection::Buy,
+            }
+        } else {
+            direction
+        };
+
+        let output = match effective_direction {
+            SwapDirection::Buy => {
+                // Y -> X: output ~ amount_in / price, capped at reserve_x.
+                let raw = (amount_in_with_fee as f64 / price) as u64;
+                raw.min(reserve_x_balance)
+            }
+            SwapDirection::Sell => {
+                // X -> Y: output ~ amount_in * price, capped at reserve_y.
+                let raw = (amount_in_with_fee as f64 * price) as u64;
+                raw.min(reserve_y_balance)
+            }
+        };
+
+        Ok(output)
+    }
+
     fn calculate_price_impact(
         &self,
         _amount_in: u64,

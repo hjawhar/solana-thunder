@@ -6,9 +6,11 @@
 use std::fs;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
+use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use solana_pubkey::Pubkey;
 use thunder_core::{GenericError, Market};
 
 use meteora_damm::{MeteoraDAMMMarket, MeteoraDAMMPool, MeteoraDAMMV2Market, MeteoraDAMMV2Pool};
@@ -99,9 +101,13 @@ fn make_entry(
     cached_data: Vec<u8>,
 ) -> (String, PoolEntry) {
     let meta = market.metadata().unwrap();
+    let pool_pubkey = Pubkey::from_str(&addr).unwrap_or_default();
     (addr, PoolEntry {
         quote_mint: meta.quote_mint,
         base_mint: meta.base_mint,
+        pool_pubkey,
+        quote_vault: meta.quote_vault,
+        base_vault: meta.base_vault,
         market: Box::new(market),
         dex_name: dex.into(),
         cached_data,
@@ -112,8 +118,6 @@ fn make_entry(
 // Auxiliary PDA extraction from cached pool data
 // ---------------------------------------------------------------------------
 
-use std::str::FromStr;
-use solana_pubkey::Pubkey;
 
 /// Extract tick array PDAs for a CLMM pool from its serialized cached data.
 /// Returns `(pool_pubkey, tick_array_pdas)` or None for non-CLMM pools.

@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use solana_pubkey::Pubkey;
-use thunder_core::{GenericError, SwapDirection, JITOSOL, MSOL, USDC, USDT, WSOL};
+use thunder_core::{AccountDataProvider, GenericError, SwapDirection, JITOSOL, MSOL, USDC, USDT, WSOL};
 
 use crate::pool_index::PoolIndex;
 use crate::types::{Quote, Route, RouteHop};
@@ -29,6 +29,7 @@ pub struct Router<'a> {
     index: &'a PoolIndex,
     max_hops: usize,
     swappable_set: Option<Arc<HashSet<String>>>,
+    live_data: Option<&'a dyn AccountDataProvider>,
 }
 
 impl<'a> Router<'a> {
@@ -37,12 +38,19 @@ impl<'a> Router<'a> {
             index,
             max_hops,
             swappable_set: None,
+            live_data: None,
         }
     }
 
     /// Restrict routing to only the given pool addresses.
     pub fn with_swappable_set(mut self, set: Arc<HashSet<String>>) -> Self {
         self.swappable_set = Some(set);
+        self
+    }
+
+    /// Provide live on-chain data for routing calculations.
+    pub fn with_live_data(mut self, provider: &'a dyn AccountDataProvider) -> Self {
+        self.live_data = Some(provider);
         self
     }
 
@@ -146,7 +154,7 @@ impl<'a> Router<'a> {
         out: &mut Vec<Route>,
     ) {
         for addr in self.index.direct_pools(input, output) {
-            if let Some(route) = simulate_path(self.index, &[(addr, *input, *output)], amount_in, self.swappable_set.as_deref()) {
+            if let Some(route) = simulate_path(self.index, &[(addr, *input, *output)], amount_in, self.swappable_set.as_deref(), self.live_data) {
                 out.push(route);
             }
         }
@@ -168,16 +176,12 @@ impl<'a> Router<'a> {
         }
 
         // Try top N pools per leg to find viable routes (not just the single best).
-        let top_leg1 = top_pools(self.index, &leg1, *input, amount_in, 3, self.swappable_set.as_deref());
+        let top_leg1 = top_pools(self.index, &leg1, *input, amount_in, 3, self.swappable_set.as_deref(), self.live_data);
         for (a1, mid_amount) in &top_leg1 {
-            let top_leg2 = top_pools(self.index, &leg2, *mid, *mid_amount, 3, self.swappable_set.as_deref());
+            let top_leg2 = top_pools(self.index, &leg2, *mid, *mid_amount, 3, self.swappable_set.as_deref(), self.live_data);
             for (a2, _) in &top_leg2 {
-                if let Some(route) = simulate_path(
-                    self.index,
-                    &[(a1.clone(), *input, *mid), (a2.clone(), *mid, *output)],
-                    amount_in,
-                    self.swappable_set.as_deref(),
-                ) {
+                if let Some(route) = simulate_path(self.index, &[(a1.clone(), *input, *mid), (a2.clone(), *mid, *output)],
+                amount_in, self.swappable_set.as_deref(), self.live_data) {
                     out.push(route);
                 }
             }
@@ -210,7 +214,7 @@ impl<'a> Router<'a> {
                 continue;
             }
 
-            let Some(hop1) = simulate_hop(self.index, pool_addr, *input, amount_in, self.swappable_set.as_deref()) else {
+            let Some(hop1) = simulate_hop(self.index, pool_addr, *input, amount_in, self.swappable_set.as_deref(), self.live_data) else {
                 tried += 1;
                 continue;
             };
@@ -219,17 +223,13 @@ impl<'a> Router<'a> {
                 continue;
             }
 
-            let Some((a2, _)) = best_pool(self.index, &leg2, *mid, hop1.output_amount, self.swappable_set.as_deref()) else {
+            let Some((a2, _)) = best_pool(self.index, &leg2, *mid, hop1.output_amount, self.swappable_set.as_deref(), self.live_data) else {
                 tried += 1;
                 continue;
             };
 
-            if let Some(route) = simulate_path(
-                self.index,
-                &[(pool_addr.clone(), *input, *mid), (a2, *mid, *output)],
-                amount_in,
-                self.swappable_set.as_deref(),
-            ) {
+            if let Some(route) = simulate_path(self.index, &[(pool_addr.clone(), *input, *mid), (a2, *mid, *output)],
+            amount_in, self.swappable_set.as_deref(), self.live_data) {
                 out.push(route);
             }
 
@@ -265,23 +265,19 @@ impl<'a> Router<'a> {
             }
 
             // Simulate: input → mid (best pool) → output (best pool)
-            let Some((a1, mid_amount)) = best_pool(self.index, &leg1, *input, amount_in, self.swappable_set.as_deref()) else {
+            let Some((a1, mid_amount)) = best_pool(self.index, &leg1, *input, amount_in, self.swappable_set.as_deref(), self.live_data) else {
                 tried += 1;
                 continue;
             };
 
             let leg2 = self.index.direct_pools(mid, output);
-            let Some((a2, _)) = best_pool(self.index, &leg2, *mid, mid_amount, self.swappable_set.as_deref()) else {
+            let Some((a2, _)) = best_pool(self.index, &leg2, *mid, mid_amount, self.swappable_set.as_deref(), self.live_data) else {
                 tried += 1;
                 continue;
             };
 
-            if let Some(route) = simulate_path(
-                self.index,
-                &[(a1, *input, *mid), (a2, *mid, *output)],
-                amount_in,
-                self.swappable_set.as_deref(),
-            ) {
+            if let Some(route) = simulate_path(self.index, &[(a1, *input, *mid), (a2, *mid, *output)],
+            amount_in, self.swappable_set.as_deref(), self.live_data) {
                 out.push(route);
             }
 
@@ -306,16 +302,12 @@ impl<'a> Router<'a> {
             return;
         }
 
-        let Some((a1, amt1)) = best_pool(self.index, &l1, *input, amount_in, self.swappable_set.as_deref()) else { return };
-        let Some((a2, amt2)) = best_pool(self.index, &l2, *h1, amt1, self.swappable_set.as_deref()) else { return };
-        let Some((a3, _)) = best_pool(self.index, &l3, *h2, amt2, self.swappable_set.as_deref()) else { return };
+        let Some((a1, amt1)) = best_pool(self.index, &l1, *input, amount_in, self.swappable_set.as_deref(), self.live_data) else { return };
+        let Some((a2, amt2)) = best_pool(self.index, &l2, *h1, amt1, self.swappable_set.as_deref(), self.live_data) else { return };
+        let Some((a3, _)) = best_pool(self.index, &l3, *h2, amt2, self.swappable_set.as_deref(), self.live_data) else { return };
 
-        if let Some(route) = simulate_path(
-            self.index,
-            &[(a1, *input, *h1), (a2, *h1, *h2), (a3, *h2, *output)],
-            amount_in,
-            self.swappable_set.as_deref(),
-        ) {
+        if let Some(route) = simulate_path(self.index, &[(a1, *input, *h1), (a2, *h1, *h2), (a3, *h2, *output)],
+        amount_in, self.swappable_set.as_deref(), self.live_data) {
             out.push(route);
         }
     }
@@ -414,31 +406,27 @@ impl<'a> Router<'a> {
                         continue;
                     }
 
-                    let Some((a1, amt1)) = best_pool(self.index, &l1, *input, amount_in, self.swappable_set.as_deref())
+                    let Some((a1, amt1)) = best_pool(self.index, &l1, *input, amount_in, self.swappable_set.as_deref(), self.live_data)
                     else {
                         continue;
                     };
-                    let Some((a2, amt2)) = best_pool(self.index, &l2, *n_in, amt1, self.swappable_set.as_deref()) else {
+                    let Some((a2, amt2)) = best_pool(self.index, &l2, *n_in, amt1, self.swappable_set.as_deref(), self.live_data) else {
                         continue;
                     };
-                    let Some((a3, amt3)) = best_pool(self.index, &l3, *hub, amt2, self.swappable_set.as_deref()) else {
+                    let Some((a3, amt3)) = best_pool(self.index, &l3, *hub, amt2, self.swappable_set.as_deref(), self.live_data) else {
                         continue;
                     };
-                    let Some((a4, _)) = best_pool(self.index, &l4, *n_out, amt3, self.swappable_set.as_deref()) else {
+                    let Some((a4, _)) = best_pool(self.index, &l4, *n_out, amt3, self.swappable_set.as_deref(), self.live_data) else {
                         continue;
                     };
 
-                    if let Some(route) = simulate_path(
-                        self.index,
-                        &[
-                            (a1, *input, *n_in),
-                            (a2, *n_in, *hub),
-                            (a3, *hub, *n_out),
-                            (a4, *n_out, *output),
-                        ],
-                        amount_in,
-                        self.swappable_set.as_deref(),
-                    ) {
+                    if let Some(route) = simulate_path(self.index, &[
+                        (a1, *input, *n_in),
+                        (a2, *n_in, *hub),
+                        (a3, *hub, *n_out),
+                        (a4, *n_out, *output),
+                    ],
+                    amount_in, self.swappable_set.as_deref(), self.live_data) {
                         out.push(route);
                     }
                 }
@@ -451,14 +439,14 @@ impl<'a> Router<'a> {
 // Simulation helpers
 // =============================================================================
 
-/// Simulate a single hop: determine direction from pre-resolved mints, compute output.
-/// Avoids metadata() allocation entirely — direction comes from PoolEntry.quote_mint/base_mint.
+/// Simulate a single hop using live data when available.
 fn simulate_hop(
     index: &PoolIndex,
     pool_address: &str,
     input_mint: Pubkey,
     amount_in: u64,
     swappable: Option<&HashSet<String>>,
+    live: Option<&dyn AccountDataProvider>,
 ) -> Option<RouteHop> {
     if let Some(set) = swappable {
         if !set.contains(pool_address) {
@@ -468,7 +456,6 @@ fn simulate_hop(
 
     let entry = index.get_pool(pool_address)?;
 
-    // When no swappable set, fall back to per-hop checks.
     if swappable.is_none() {
         if !entry.market.is_active() {
             return None;
@@ -480,7 +467,6 @@ fn simulate_hop(
         }
     }
 
-    // Direction from pre-resolved mints — no metadata() call needed.
     let (direction, output_mint) = if input_mint == entry.quote_mint {
         (SwapDirection::Buy, entry.base_mint)
     } else if input_mint == entry.base_mint {
@@ -489,12 +475,21 @@ fn simulate_hop(
         return None;
     };
 
-    let output_amount = entry.market.calculate_output(amount_in, direction).ok()?;
+    // Use live data when a provider is available.
+    let output_amount = if let Some(provider) = live {
+        let pool_data = provider.pool_account_data(&entry.pool_pubkey);
+        let quote_bal = provider.token_balance(&entry.quote_vault);
+        let base_bal = provider.token_balance(&entry.base_vault);
+        entry.market.calculate_output_live(
+            amount_in, direction, pool_data.as_deref(), quote_bal, base_bal,
+        ).ok()?
+    } else {
+        entry.market.calculate_output(amount_in, direction).ok()?
+    };
+
     if output_amount == 0 {
         return None;
     }
-
-    // Anti-dust: reject absurd output ratios.
     if output_amount > amount_in.saturating_mul(1_000_000) {
         return None;
     }
@@ -510,40 +505,31 @@ fn simulate_hop(
     })
 }
 
-/// Simulate a full multi-hop path. Returns None if any hop fails or a cycle is detected.
+/// Simulate a full multi-hop path.
 fn simulate_path(
     index: &PoolIndex,
     hops: &[(String, Pubkey, Pubkey)],
     initial_amount: u64,
     swappable: Option<&HashSet<String>>,
+    live: Option<&dyn AccountDataProvider>,
 ) -> Option<Route> {
-    if hops.is_empty() {
-        return None;
-    }
-
-    // Cycle detection.
+    if hops.is_empty() { return None; }
     let mut visited = HashSet::new();
     visited.insert(hops[0].1);
     for (_, _, out_mint) in hops {
-        if !visited.insert(*out_mint) {
-            return None;
-        }
+        if !visited.insert(*out_mint) { return None; }
     }
-
     let mut result_hops = Vec::with_capacity(hops.len());
     let mut current_amount = initial_amount;
     let mut total_impact: u64 = 0;
-
     for (pool_address, input_mint, _) in hops {
-        let hop = simulate_hop(index, pool_address, *input_mint, current_amount, swappable)?;
+        let hop = simulate_hop(index, pool_address, *input_mint, current_amount, swappable, live)?;
         current_amount = hop.output_amount;
         total_impact = total_impact.saturating_add(hop.price_impact_bps);
         result_hops.push(hop);
     }
-
     let first = result_hops.first()?;
     let last = result_hops.last()?;
-
     Some(Route {
         input_mint: first.input_mint,
         output_mint: last.output_mint,
@@ -561,16 +547,16 @@ fn best_pool(
     input_mint: Pubkey,
     amount_in: u64,
     swappable: Option<&HashSet<String>>,
+    live: Option<&dyn AccountDataProvider>,
 ) -> Option<(String, u64)> {
     pool_addresses
         .iter()
         .filter_map(|addr| {
-            let hop = simulate_hop(index, addr, input_mint, amount_in, swappable)?;
+            let hop = simulate_hop(index, addr, input_mint, amount_in, swappable, live)?;
             Some((addr.clone(), hop.output_amount))
         })
         .max_by_key(|(_, out)| *out)
 }
-
 
 /// Return the top N pools by output amount.
 fn top_pools(
@@ -580,11 +566,12 @@ fn top_pools(
     amount_in: u64,
     n: usize,
     swappable: Option<&HashSet<String>>,
+    live: Option<&dyn AccountDataProvider>,
 ) -> Vec<(String, u64)> {
     let mut candidates: Vec<(String, u64)> = pool_addresses
         .iter()
         .filter_map(|addr| {
-            let hop = simulate_hop(index, addr, input_mint, amount_in, swappable)?;
+            let hop = simulate_hop(index, addr, input_mint, amount_in, swappable, live)?;
             Some((addr.clone(), hop.output_amount))
         })
         .collect();

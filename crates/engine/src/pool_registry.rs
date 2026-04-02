@@ -37,8 +37,9 @@ pub struct PoolRegistry {
     edges: HashMap<Pubkey, Vec<(Pubkey, String)>>,
     dex_counts: HashMap<String, usize>,
     swappable_count: AtomicUsize,
-    /// Pre-built set, rebuilt during validate_from_cache / validate_all.
     cached_swappable: Arc<HashSet<String>>,
+    /// vault_pubkey -> pool_address (for streaming re-validation).
+    vault_to_pool: HashMap<Pubkey, Vec<String>>,
 }
 
 impl PoolRegistry {
@@ -49,6 +50,7 @@ impl PoolRegistry {
             dex_counts: HashMap::new(),
             swappable_count: AtomicUsize::new(0),
             cached_swappable: Arc::new(HashSet::new()),
+            vault_to_pool: HashMap::new(),
         }
     }
 
@@ -112,6 +114,10 @@ impl PoolRegistry {
             .entry(base_mint)
             .or_default()
             .push((quote_mint, address.clone()));
+
+        // Reverse index: vault pubkey -> pool address.
+        self.vault_to_pool.entry(info.quote_vault).or_default().push(address.clone());
+        self.vault_to_pool.entry(info.base_vault).or_default().push(address.clone());
 
         *self.dex_counts.entry(info.dex_name.clone()).or_insert(0) += 1;
 
@@ -192,6 +198,46 @@ impl PoolRegistry {
                 self.swappable_count.fetch_sub(1, Ordering::Relaxed);
             }
         }
+    }
+
+    /// Called by streaming when a vault account changes.
+    /// Looks up which pools use this vault and re-validates them.
+    /// Updates the cached swappable set if any status changes.
+    pub fn on_vault_update(&mut self, vault: &Pubkey, store: &AccountStore) {
+        let pool_addrs = match self.vault_to_pool.get(vault) {
+            Some(addrs) => addrs.clone(),
+            None => return,
+        };
+        let mut changed = false;
+        for addr in &pool_addrs {
+            let info = match self.pools.get_mut(addr.as_str()) {
+                Some(i) => i,
+                None => continue,
+            };
+            let was = info.swappable;
+            let now = check_swappable(info, store);
+            if was != now {
+                info.swappable = now;
+                if now {
+                    self.swappable_count.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.swappable_count.fetch_sub(1, Ordering::Relaxed);
+                }
+                changed = true;
+            }
+        }
+        if changed {
+            self.rebuild_swappable_set();
+        }
+    }
+
+    fn rebuild_swappable_set(&mut self) {
+        let set: HashSet<String> = self.pools
+            .iter()
+            .filter(|(_, info)| info.swappable)
+            .map(|(addr, _)| addr.clone())
+            .collect();
+        self.cached_swappable = Arc::new(set);
     }
 
     /// Validate all pools against the account store and recompute swappable set.

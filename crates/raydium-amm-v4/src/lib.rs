@@ -169,6 +169,43 @@ impl Market for RaydiumAmmV4Market {
         }
     }
 
+    fn calculate_output_live(
+        &self,
+        amount_in: u64,
+        direction: SwapDirection,
+        _pool_data: Option<&[u8]>,
+        quote_vault_balance: u64,
+        base_vault_balance: u64,
+    ) -> Result<u64, GenericError> {
+        if _pool_data.is_none() {
+            return self.calculate_output(amount_in, direction);
+        }
+
+        let fee_bps = (self.pool.trade_fee_numerator as f64
+            / self.pool.trade_fee_denominator as f64
+            * 10000.0) as u64;
+
+        // Same flipping logic as calculate_output: when flipped, the caller's
+        // normalized quote/base are already swapped, but the swap math expects
+        // physical orientation, so we swap them back.
+        let (quote_bal, base_bal) = if self.flipped {
+            (base_vault_balance, quote_vault_balance)
+        } else {
+            (quote_vault_balance, base_vault_balance)
+        };
+
+        match direction {
+            SwapDirection::Buy => {
+                // Quote -> Base
+                constant_product_swap(quote_bal, base_bal, amount_in, fee_bps)
+            }
+            SwapDirection::Sell => {
+                // Base -> Quote
+                constant_product_swap(base_bal, quote_bal, amount_in, fee_bps)
+            }
+        }
+    }
+
     fn calculate_price_impact(
         &self,
         amount_in: u64,

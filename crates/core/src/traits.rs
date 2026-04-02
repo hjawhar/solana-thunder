@@ -88,6 +88,24 @@ pub trait Market: Send + Sync {
 
     /// Get the current mid-market price (quote per base, e.g. SOL per token).
     fn current_price(&self) -> Result<f64, GenericError>;
+
+    /// Calculate output using live on-chain data from the AccountStore.
+    /// `pool_data`: raw bytes of the pool account (if available from store).
+    /// `quote_vault_balance` / `base_vault_balance`: live vault token balances.
+    ///
+    /// Default: ignores live data and delegates to `calculate_output`.
+    /// Override in DEX crates to parse swap-volatile fields (sqrt_price,
+    /// active_id, liquidity, virtual reserves) from `pool_data` bytes.
+    fn calculate_output_live(
+        &self,
+        amount_in: u64,
+        direction: SwapDirection,
+        _pool_data: Option<&[u8]>,
+        _quote_vault_balance: u64,
+        _base_vault_balance: u64,
+    ) -> Result<u64, GenericError> {
+        self.calculate_output(amount_in, direction)
+    }
 }
 
 // ============================================================================
@@ -121,4 +139,20 @@ pub fn constant_product_swap(
     let numerator = amount_in_with_fee * reserve_out as u128;
     let denominator = reserve_in as u128 + amount_in_with_fee;
     Ok((numerator / denominator) as u64)
+}
+
+
+// ============================================================================
+// Live Data Provider
+// ============================================================================
+
+/// Provides live account data for routing. Implemented by the engine's
+/// AccountStore so the aggregator Router can read fresh on-chain state
+/// without depending on the engine crate.
+pub trait AccountDataProvider: Send + Sync {
+    /// Raw account data for a pool, keyed by its on-chain Pubkey.
+    fn pool_account_data(&self, pubkey: &Pubkey) -> Option<Vec<u8>>;
+
+    /// SPL token account balance (offset 64..72 in token account data).
+    fn token_balance(&self, vault_pubkey: &Pubkey) -> u64;
 }

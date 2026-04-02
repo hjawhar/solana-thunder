@@ -111,7 +111,8 @@ async fn handle_quote(
 
     let swappable = state.registry.read().await.swappable_set();
     let router = Router::new(&state.pool_index, max_hops)
-        .with_swappable_set(swappable);
+        .with_swappable_set(swappable)
+        .with_live_data(state.store.as_ref());
     let quote = router
         .find_routes(input_mint, output_mint, params.amount, 5)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("routing error: {e}")))?;

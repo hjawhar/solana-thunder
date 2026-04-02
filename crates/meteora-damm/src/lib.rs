@@ -172,6 +172,83 @@ impl Market for MeteoraDAMMMarket {
         self.calculate_damm_output(amount_in, direction)
     }
 
+    fn calculate_output_live(
+        &self,
+        amount_in: u64,
+        direction: SwapDirection,
+        _pool_data: Option<&[u8]>,
+        quote_vault_balance: u64,
+        base_vault_balance: u64,
+    ) -> Result<u64, GenericError> {
+        if _pool_data.is_none() {
+            return self.calculate_output(amount_in, direction);
+        }
+
+        let fee_bps = (self.pool.fees.trade_fee_numerator as f64
+            / self.pool.fees.trade_fee_denominator as f64
+            * 10000.0) as u64;
+
+        // Reconstruct physical (a_vault, b_vault) from normalized (quote, base).
+        // When !flipped: quote=b_vault, base=a_vault.
+        // When  flipped: quote=a_vault, base=b_vault.
+        let (a_vault_balance, b_vault_balance) = if self.flipped {
+            (quote_vault_balance, base_vault_balance)
+        } else {
+            (base_vault_balance, quote_vault_balance)
+        };
+
+        let physical_direction = if self.flipped {
+            match direction {
+                SwapDirection::Buy => SwapDirection::Sell,
+                SwapDirection::Sell => SwapDirection::Buy,
+            }
+        } else {
+            direction
+        };
+
+        match &self.pool.curve_type {
+            CurveType::ConstantProduct => match physical_direction {
+                SwapDirection::Buy => constant_product_swap(
+                    b_vault_balance,
+                    a_vault_balance,
+                    amount_in,
+                    fee_bps,
+                ),
+                SwapDirection::Sell => constant_product_swap(
+                    a_vault_balance,
+                    b_vault_balance,
+                    amount_in,
+                    fee_bps,
+                ),
+            },
+            CurveType::Stable { amp, .. } => {
+                let base_output = match physical_direction {
+                    SwapDirection::Buy => constant_product_swap(
+                        b_vault_balance,
+                        a_vault_balance,
+                        amount_in,
+                        fee_bps,
+                    )?,
+                    SwapDirection::Sell => constant_product_swap(
+                        a_vault_balance,
+                        b_vault_balance,
+                        amount_in,
+                        fee_bps,
+                    )?,
+                };
+
+                let amp_factor = (*amp as f64 / 100.0).min(10.0);
+                let stable_output = (base_output as f64 * (1.0 + amp_factor / 100.0)) as u64;
+
+                // Cap at available reserves.
+                Ok(stable_output.min(match physical_direction {
+                    SwapDirection::Buy => a_vault_balance,
+                    SwapDirection::Sell => b_vault_balance,
+                }))
+            }
+        }
+    }
+
     fn calculate_price_impact(
         &self,
         amount_in: u64,
@@ -360,6 +437,61 @@ impl Market for MeteoraDAMMV2Market {
         direction: SwapDirection,
     ) -> Result<u64, GenericError> {
         self.calculate_v2_output(amount_in, direction)
+    }
+
+    fn calculate_output_live(
+        &self,
+        amount_in: u64,
+        direction: SwapDirection,
+        pool_data: Option<&[u8]>,
+        quote_vault_balance: u64,
+        base_vault_balance: u64,
+    ) -> Result<u64, GenericError> {
+        // Reconstruct physical vault balances from normalized inputs.
+        let (a_vault_balance, b_vault_balance) = if self.flipped {
+            (quote_vault_balance, base_vault_balance)
+        } else {
+            (base_vault_balance, quote_vault_balance)
+        };
+
+        // Parse live sqrt_price from pool_data if available, else use cached.
+        let sqrt_price: u128 = match pool_data {
+            Some(data) if data.len() >= 472 => {
+                let bytes: [u8; 16] = data[456..472].try_into().unwrap();
+                u128::from_le_bytes(bytes)
+            }
+            _ => self.pool.sqrt_price,
+        };
+
+        let sqrt_price_f64 = sqrt_price as f64 / (1u128 << 64) as f64;
+        let price = sqrt_price_f64 * sqrt_price_f64
+            * 10f64.powi(self.token_a_decimals as i32 - self.token_b_decimals as i32);
+
+        let fee_bps = self.calculate_base_fee_bps();
+        let fee_multiplier = 10000 - fee_bps;
+        let amount_in_with_fee = (amount_in as u128 * fee_multiplier as u128) / 10000;
+
+        let physical_direction = if self.flipped {
+            match direction {
+                SwapDirection::Buy => SwapDirection::Sell,
+                SwapDirection::Sell => SwapDirection::Buy,
+            }
+        } else {
+            direction
+        };
+
+        let output = match physical_direction {
+            SwapDirection::Buy => {
+                let raw = (amount_in_with_fee as f64 / price) as u64;
+                raw.min(a_vault_balance)
+            }
+            SwapDirection::Sell => {
+                let raw = (amount_in_with_fee as f64 * price) as u64;
+                raw.min(b_vault_balance)
+            }
+        };
+
+        Ok(output)
     }
 
     fn calculate_price_impact(

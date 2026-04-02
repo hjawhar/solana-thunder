@@ -64,7 +64,7 @@ solana-thunder/
 +-- src/lib.rs                          # Root crate: re-exports all DEX crates
 +-- crates/
 |   +-- core/src/
-|   |   +-- traits.rs                   # Market trait, PoolMetadata, PoolFinancials, is_active()
+|   |   +-- traits.rs                   # Market trait, AccountDataProvider, calculate_output_live
 |   |   +-- constants.rs                # WSOL, USDC, USDT, quote_priority, infer_mint_decimals
 |   +-- raydium-amm-v4/src/lib.rs       # RaydiumAMMV4 + RaydiumAmmV4Market
 |   +-- raydium-clmm/src/
@@ -81,17 +81,17 @@ solana-thunder/
 |   +-- aggregator/src/                 # Pool loading, routing, swap building, caching, CLI
 |   |   +-- loader.rs                   # Async RPC pool loading (all DEXs, no mint filter)
 |   |   +-- cache.rs                    # Disk cache + PDA extraction (extract_clmm_tick_pdas, extract_dlmm_bin_pda)
-|   |   +-- router.rs                   # Multi-hop routing (1-2 hops default, maxHops param, cached swappable set)
+|   |   +-- router.rs                   # Multi-hop routing (live data via AccountDataProvider, cached swappable set)
 |   |   +-- swap_builder.rs             # Swap instructions for all 6 DEXs
 |   |   +-- price.rs                    # SOL/USD on-chain via CLMM sqrt_price
 |   |   +-- pool_index.rs               # In-memory token-pair graph
 |   |   +-- cli.rs                      # Progress bars + interactive REPL
 |   |   +-- main.rs                     # CLI binary (thunder-agg)
 |   +-- engine/src/                     # Persistent service (library only, binary in bin/)
-|   |   +-- account_store.rs            # DashMap store for all account data
-|   |   +-- pool_registry.rs            # Pool index + swappable validation (is_active + vaults_funded, validate_from_cache)
+|   |   +-- account_store.rs            # DashMap store, implements AccountDataProvider
+|   |   +-- pool_registry.rs            # Swappable validation (cached Arc<HashSet>, vault-to-pool reverse index)
 |   |   +-- cold_start.rs               # Background: vault fetch (100 concurrent), tick arrays, bin arrays, bitmap exts
-|   |   +-- streaming.rs                # Yellowstone gRPC subscriber
+|   |   +-- streaming.rs                # Yellowstone gRPC: live updates + vault re-validation (Token + Token-2022)
 |   |   +-- api.rs                      # Axum HTTP: /quote, /swap, /price, /health
 |   +-- router-program/                 # On-chain CPI router (excluded from workspace)
 |       +-- src/lib.rs                   # CPI multi-hop swap program
@@ -191,7 +191,7 @@ The engine starts serving HTTP immediately after cache load (~6s). No blocking v
 1. Load cache              ~6s   pools.cache -> PoolIndex
 2. validate_from_cache     instant  uses market.financials() (cached vault balances)
 3. Start HTTP server       instant  /quote works immediately
-4. gRPC streaming          background  live account updates
+4. gRPC streaming          background  live account updates + vault re-validation
 5. Vault fetch             background  4M+ accounts, 100 concurrent batches
 6. SOL/USD price refresh   background  every 15s
 ```
@@ -216,7 +216,7 @@ Route discovery only gates on pool status and liquidity -- NOT auxiliary account
 | Raydium AMM V4 | vaults funded |
 | All others | `is_active()` AND vaults funded |
 
-`calculate_output()` uses pool struct fields (sqrt_price, active_id, tick_current) which are in the deserialized pool data. Tick arrays, bin arrays, and bitmap extensions are only needed for building on-chain swap instructions, not for computing quotes.
+`calculate_output_live()` reads live pool state (sqrt_price, active_id, liquidity) and vault balances from the `AccountStore` via the `AccountDataProvider` trait on every quote request. Tick arrays, bin arrays, and bitmap extensions are only needed for building on-chain swap instructions, not for computing quotes. Streaming triggers `on_vault_update()` to re-validate swappable status when Token Program or Token-2022 vault balances change.
 
 ### Pool Cache
 
@@ -242,9 +242,16 @@ pub trait Market: Send + Sync {
     fn metadata(&self) -> Result<PoolMetadata, GenericError>;
     fn financials(&self) -> Result<PoolFinancials, GenericError>;
     fn calculate_output(&self, amount_in: u64, direction: SwapDirection) -> Result<u64, GenericError>;
+    fn calculate_output_live(&self, amount_in: u64, direction: SwapDirection,
+        pool_data: Option<&[u8]>, quote_vault_balance: u64, base_vault_balance: u64,
+    ) -> Result<u64, GenericError> { self.calculate_output(amount_in, direction) }
     fn calculate_price_impact(&self, amount_in: u64, direction: SwapDirection) -> Result<u64, GenericError>;
     fn current_price(&self) -> Result<f64, GenericError>;
-    // ... default convenience methods
+}
+
+pub trait AccountDataProvider: Send + Sync {
+    fn pool_account_data(&self, pubkey: &Pubkey) -> Option<Vec<u8>>;
+    fn token_balance(&self, vault_pubkey: &Pubkey) -> u64;
 }
 ```
 
@@ -303,16 +310,16 @@ let ix = swap_builder::build_clmm_swap(&ClmmSwapAccounts { ... }, amount, min_ou
 | File | What it is |
 |---|---|
 | `bin/engine.rs` | Engine binary: instant startup, background vault fetch, 15s SOL/USD refresh |
-| `crates/engine/src/account_store.rs` | DashMap store for all account data (pools, vaults, tick arrays) |
-| `crates/engine/src/pool_registry.rs` | Pool index + swappable validation (cached `Arc<HashSet>`, `validate_from_cache`) |
-| `crates/engine/src/cold_start.rs` | Background: vault fetch (100 concurrent), tick arrays (PDA-derived), bin arrays, bitmap exts |
-| `crates/engine/src/streaming.rs` | Yellowstone gRPC subscriber for live account updates |
-| `crates/engine/src/api.rs` | Axum HTTP: /quote (<400ms target), /swap, /price, /health |
+| `crates/engine/src/account_store.rs` | DashMap store, implements `AccountDataProvider` for live routing |
+| `crates/engine/src/pool_registry.rs` | Swappable validation (cached `Arc<HashSet>`, vault-to-pool reverse index) |
+| `crates/engine/src/cold_start.rs` | Background: vault fetch (100 concurrent), tick arrays, bin arrays, bitmap exts |
+| `crates/engine/src/streaming.rs` | Yellowstone gRPC: live updates + vault re-validation (Token + Token-2022) |
+| `crates/engine/src/api.rs` | Axum HTTP: /quote (live data via AccountDataProvider), /swap, /price, /health |
 | `crates/aggregator/src/swap_builder.rs` | Swap instructions for all 6 DEXs (+ from_pool_data variants) |
-| `crates/aggregator/src/router.rs` | Multi-hop routing (1-4 hops, pre-resolved mints, no metadata() in hot path) |
+| `crates/aggregator/src/router.rs` | Multi-hop routing (live data, pre-resolved mints, cached swappable set) |
 | `crates/aggregator/src/loader.rs` | RPC pool loading (discriminator + dataSize filters) |
-| `crates/aggregator/src/cache.rs` | Disk cache + PDA extraction helpers (`extract_clmm_tick_pdas`, `extract_dlmm_bin_pda`) |
-| `crates/core/src/traits.rs` | Market trait, PoolMetadata, PoolFinancials, is_active() |
+| `crates/aggregator/src/cache.rs` | Disk cache + PDA extraction helpers |
+| `crates/core/src/traits.rs` | Market trait, AccountDataProvider, calculate_output_live |
 | `crates/router-program/src/lib.rs` | On-chain CPI router with exact amount chaining |
 | `tests/surfpool_swap.rs` | Dynamic multi-hop swap on Surfpool (any token pair) |
 

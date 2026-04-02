@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
@@ -9,6 +10,7 @@ use yellowstone_grpc_proto::prelude::*;
 use yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof;
 
 use crate::account_store::AccountStore;
+use crate::pool_registry::PoolRegistry;
 
 /// DEX program IDs + Token Program to subscribe to.
 const OWNER_PROGRAMS: &[&str] = &[
@@ -19,6 +21,7 @@ const OWNER_PROGRAMS: &[&str] = &[
     "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo",   // Meteora DLMM
     "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA",   // Pumpfun AMM
     "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",   // Token Program
+    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",   // Token-2022
 ];
 
 const STATS_INTERVAL: Duration = Duration::from_secs(10);
@@ -30,10 +33,13 @@ const MAX_DECODING_SIZE: usize = 64 * 1024 * 1024;
 ///
 /// Reconnects with exponential backoff on any error. Meant to be spawned
 /// as a background tokio task.
-pub async fn start_streaming(store: Arc<AccountStore>) {
+pub async fn start_streaming(
+    store: Arc<AccountStore>,
+    registry: Arc<RwLock<PoolRegistry>>,
+) {
     let mut backoff = Duration::from_secs(1);
     loop {
-        match run_stream(&store).await {
+        match run_stream(&store, &registry).await {
             Ok(()) => {
                 // Stream ended cleanly (server closed) — reset backoff, reconnect.
                 backoff = Duration::from_secs(1);
@@ -48,7 +54,7 @@ pub async fn start_streaming(store: Arc<AccountStore>) {
 }
 
 /// Single connect → subscribe → consume cycle. Returns on stream end or error.
-async fn run_stream(store: &AccountStore) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_stream(store: &AccountStore, registry: &RwLock<PoolRegistry>) -> Result<(), Box<dyn std::error::Error>> {
     let endpoint =
         std::env::var("GEYSER_ENDPOINT").expect("GEYSER_ENDPOINT env var must be set");
     let token = std::env::var("GEYSER_TOKEN").ok();
@@ -103,6 +109,16 @@ async fn run_stream(store: &AccountStore) -> Result<(), Box<dyn std::error::Erro
                 };
                 store.upsert(pubkey, account.data, owner, account.lamports, account_update.slot);
                 updates_count += 1;
+
+                // Re-validate pools affected by vault balance changes.
+                // Both Token Program and Token-2022 accounts can be vaults.
+                let is_token_account =
+                    owner == Pubkey::from_str_const("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+                    || owner == Pubkey::from_str_const("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
+                if is_token_account {
+                    let mut reg = registry.write().await;
+                    reg.on_vault_update(&pubkey, store);
+                }
             }
         }
 

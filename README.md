@@ -148,7 +148,7 @@ solana-thunder            Root crate: re-exports all DEX crates
 1. Load cache              ~6s   pools.cache -> PoolIndex
 2. validate_from_cache     instant  cached vault balances -> swappable set
 3. Start HTTP server       instant  /quote works immediately
-4. gRPC streaming          background  live account updates
+4. gRPC streaming          background  live account updates + vault re-validation
 5. Vault fetch             background  4M+ accounts, 100 concurrent batches
 6. SOL/USD price refresh   background  every 15s
 ```
@@ -156,14 +156,16 @@ solana-thunder            Root crate: re-exports all DEX crates
 ### Engine Service Flow
 
 ```
-Yellowstone gRPC  --->  AccountStore (DashMap, all accounts in memory)
+Yellowstone gRPC  --->  AccountStore (DashMap, implements AccountDataProvider)
+                              |
+                              +--- on_vault_update (Token + Token-2022)
                               |
 RPC cold start  ------------>|  vaults, tick arrays, bitmap extensions
                               v
                         PoolRegistry (2M pools, cached Arc<HashSet> swappable set)
                               |
                               v
-                    Router (1-4 hops, pre-resolved mints, no metadata() alloc)
+                    Router (live data via AccountDataProvider, pre-resolved mints)
                               |
                               v
                     HTTP API:  GET /quote  (?maxHops=2&slippageBps=50)
@@ -178,7 +180,7 @@ solana-thunder/
 +-- bin/
 |   +-- engine.rs                     Engine binary entry point
 +-- crates/
-|   +-- core/                         Market trait, shared types, constants
+|   +-- core/                         Market trait, AccountDataProvider, calculate_output_live
 |   +-- raydium-amm-v4/               RaydiumAMMV4 + RaydiumAmmV4Market
 |   +-- raydium-clmm/                 RaydiumCLMMPool + RaydiumClmmMarket
 |   +-- meteora-damm/                 MeteoraDAMMMarket + V2Market + models
@@ -188,17 +190,17 @@ solana-thunder/
 |   |   +-- src/
 |   |       +-- loader.rs             RPC pool loading (all DEXs, no mint filter)
 |   |       +-- cache.rs              Disk cache + PDA extraction + make_entry helper
-|   |       +-- router.rs             Multi-hop routing (pre-resolved mints, cached swappable set)
+|   |       +-- router.rs             Multi-hop routing (live data, pre-resolved mints)
 |   |       +-- swap_builder.rs       Swap instructions for all 6 DEXs
 |   |       +-- price.rs              On-chain pricing (CLMM sqrt_price)
 |   |       +-- pool_index.rs         In-memory token-pair graph
 |   |       +-- cli.rs                Progress bars + REPL
 |   +-- engine/                       Persistent service (library)
 |   |   +-- src/
-|   |       +-- account_store.rs      DashMap store for all account data
-|   |       +-- pool_registry.rs      Swappable validation (cached Arc<HashSet>, validate_from_cache)
+|   |       +-- account_store.rs      DashMap store, implements AccountDataProvider
+|   |       +-- pool_registry.rs      Swappable validation (cached Arc<HashSet>, vault-to-pool index)
 |   |       +-- cold_start.rs         Background vault fetch (100 concurrent), tick arrays, bin arrays
-|   |       +-- streaming.rs          Yellowstone gRPC subscriber
+|   |       +-- streaming.rs          Yellowstone gRPC: live updates + vault re-validation (Token + Token-2022)
 |   |       +-- api.rs                Axum HTTP: /quote, /swap, /price, /health
 |   +-- router-program/               On-chain CPI router (Surfpool)
 +-- tests/

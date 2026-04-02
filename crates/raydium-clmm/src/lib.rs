@@ -275,5 +275,72 @@ impl Market for RaydiumClmmMarket {
     fn current_price(&self) -> Result<f64, GenericError> {
         Ok(self.sqrt_price_to_price())
     }
+
+    fn calculate_output_live(
+        &self,
+        amount_in: u64,
+        direction: SwapDirection,
+        pool_data: Option<&[u8]>,
+        quote_vault_balance: u64,
+        base_vault_balance: u64,
+    ) -> Result<u64, GenericError> {
+        let pool_data = match pool_data {
+            Some(d) => d,
+            None => return self.calculate_clmm_output(amount_in, direction),
+        };
+
+        if pool_data.len() < 269 {
+            return self.calculate_clmm_output(amount_in, direction);
+        }
+
+        let liquidity = u128::from_le_bytes(pool_data[237..253].try_into().unwrap());
+        let sqrt_price_x64 = u128::from_le_bytes(pool_data[253..269].try_into().unwrap());
+
+        if liquidity == 0 {
+            return Err("Pool has zero liquidity".into());
+        }
+
+        let sqrt = sqrt_price_x64 as f64 / (1u128 << 64) as f64;
+        let raw_price = sqrt * sqrt;
+
+        let physical_direction = if self.flipped {
+            match direction {
+                SwapDirection::Buy => SwapDirection::Sell,
+                SwapDirection::Sell => SwapDirection::Buy,
+            }
+        } else {
+            direction
+        };
+
+        // Map normalized vault balances back to physical vault_0 / vault_1.
+        // Caller already flipped for us, so:
+        //   flipped:     quote=vault_1, base=vault_0
+        //   not flipped: quote=vault_0, base=vault_1
+        let (vault_0_balance, vault_1_balance) = if self.flipped {
+            (base_vault_balance, quote_vault_balance)
+        } else {
+            (quote_vault_balance, base_vault_balance)
+        };
+
+        let fee_bps = 25u64;
+        let fee_multiplier = 10000 - fee_bps;
+        let amount_in_with_fee = (amount_in as u128 * fee_multiplier as u128) / 10000;
+
+        let output = match physical_direction {
+            SwapDirection::Buy => {
+                let raw = (amount_in_with_fee as f64 * raw_price) as u64;
+                raw.min(vault_1_balance)
+            }
+            SwapDirection::Sell => {
+                if raw_price == 0.0 {
+                    return Err("Zero price".into());
+                }
+                let raw = (amount_in_with_fee as f64 / raw_price) as u64;
+                raw.min(vault_0_balance)
+            }
+        };
+
+        Ok(output)
+    }
 }
 

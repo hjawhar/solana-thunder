@@ -2,6 +2,8 @@ use dashmap::DashMap;
 use solana_pubkey::Pubkey;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use thunder_core::AccountDataProvider;
+
 pub struct AccountData {
     pub data: Vec<u8>,
     pub owner: Pubkey,
@@ -70,5 +72,15 @@ impl AccountStore {
 
     pub fn len(&self) -> u64 {
         self.account_count.load(Ordering::Relaxed)
+    }
+}
+
+impl AccountDataProvider for AccountStore {
+    fn pool_account_data(&self, pubkey: &Pubkey) -> Option<Vec<u8>> {
+        self.get_data(pubkey)
+    }
+
+    fn token_balance(&self, vault_pubkey: &Pubkey) -> u64 {
+        self.read_token_balance(vault_pubkey)
     }
 }

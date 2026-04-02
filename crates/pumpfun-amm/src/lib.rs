@@ -157,6 +157,19 @@ impl Market for PumpfunAmmMarket {
         self.calculate_bonding_curve_output(amount_in, direction)
     }
 
+    fn calculate_output_live(
+        &self,
+        amount_in: u64,
+        direction: SwapDirection,
+        _pool_data: Option<&[u8]>,
+        _quote_vault_balance: u64,
+        _base_vault_balance: u64,
+    ) -> Result<u64, GenericError> {
+        // Pumpfun swap data lives in the bonding curve account, not the pool account.
+        // Live bonding curve updates would require a separate account mapping.
+        self.calculate_bonding_curve_output(amount_in, direction)
+    }
+
     fn calculate_price_impact(
         &self,
         amount_in: u64,

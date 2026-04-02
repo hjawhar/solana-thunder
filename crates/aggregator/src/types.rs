@@ -17,6 +17,11 @@ pub struct PoolEntry {
     /// Pre-resolved mints from metadata for fast direction lookup in routing.
     pub quote_mint: Pubkey,
     pub base_mint: Pubkey,
+    /// On-chain pubkey of the pool account (for live data lookups).
+    pub pool_pubkey: Pubkey,
+    /// Vault token account pubkeys (for live balance lookups).
+    pub quote_vault: Pubkey,
+    pub base_vault: Pubkey,
     /// Serialized pool data for disk cache (bincode of CachedPool variant).
     pub cached_data: Vec<u8>,
 }

@@ -84,12 +84,13 @@ async fn main() {
     // start_streaming holds a !Send future (Box<dyn Error> without Send bound),
     // so we run it on a dedicated single-threaded runtime.
     let store_bg = store.clone();
+    let registry_bg = state.registry.clone();
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .expect("failed to build streaming runtime");
-        rt.block_on(streaming::start_streaming(store_bg));
+        rt.block_on(streaming::start_streaming(store_bg, registry_bg));
     });
 
     // 5. Background: fetch fresh vault data, auxiliary accounts, re-validate.
