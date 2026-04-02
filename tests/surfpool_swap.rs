@@ -131,14 +131,13 @@ async fn test_dynamic_swap() {
         println!("  ... and {} more routes\n", quote.routes.len() - 5);
     }
 
-    // Pre-fetch CLMM tick arrays for all unique CLMM pools in routes.
-    let mut clmm_pools: Vec<(Pubkey, i32, u16)> = Vec::new(); // (pool, tick_current, tick_spacing)
+    // Pre-fetch CLMM tick arrays in parallel for all unique CLMM pools.
+    let mut clmm_pools: Vec<(Pubkey, i32, u16)> = Vec::new();
     for route in &quote.routes {
         for hop in &route.hops {
             if hop.dex_name == "Raydium CLMM" {
                 let pk = Pubkey::from_str(&hop.pool_address).unwrap();
                 if !clmm_pools.iter().any(|(p, _, _)| *p == pk) {
-                    // Read tick_current and tick_spacing from pool
                     if let Ok(acc) = rpc.get_account(&pk).await {
                         if acc.data.len() >= 273 {
                             let ts = u16::from_le_bytes(acc.data[235..237].try_into().unwrap());
@@ -150,21 +149,40 @@ async fn test_dynamic_swap() {
             }
         }
     }
-    println!("Pre-fetching tick arrays for {} CLMM pools...", clmm_pools.len());
+    println!("Fetching tick arrays for {} CLMM pools (parallel)...", clmm_pools.len());
+    let tick_futures: Vec<_> = clmm_pools.iter()
+        .map(|(pk, tc, ts)| fetch_clmm_tick_arrays(&mainnet, pk, *tc, *ts))
+        .collect();
+    let tick_results = futures::future::join_all(tick_futures).await;
     let mut tick_array_map: HashMap<Pubkey, Vec<Pubkey>> = HashMap::new();
-    for (pool_pk, tc, ts) in &clmm_pools {
-        let tas = fetch_clmm_tick_arrays(&mainnet, pool_pk, *tc, *ts).await;
+    for ((pk, _, _), tas) in clmm_pools.iter().zip(tick_results) {
         if !tas.is_empty() {
-            tick_array_map.insert(*pool_pk, tas);
+            tick_array_map.insert(*pk, tas);
         }
     }
-    println!("Found tick arrays for {}/{} pools\n", tick_array_map.len(), clmm_pools.len());
+    println!("Found tick arrays for {}/{} pools", tick_array_map.len(), clmm_pools.len());
 
-    // ── Try each route ────────────────────────────────────────────────────────────
+    // Pre-filter routes: skip routes with hops we know will fail.
+    let viable_routes: Vec<&Route> = quote.routes.iter().filter(|route| {
+        route.hops.iter().all(|hop| {
+            match hop.dex_name.as_str() {
+                "Raydium CLMM" => {
+                    // Skip if we couldn't find tick arrays
+                    let pk = Pubkey::from_str(&hop.pool_address).unwrap();
+                    tick_array_map.contains_key(&pk)
+                }
+                "Meteora DLMM" => true, // Can't pre-filter bitmap ext reliably
+                _ => true,
+            }
+        })
+    }).collect();
+    println!("{} viable routes (filtered from {})\n", viable_routes.len(), quote.routes.len());
+
+    // ── Try each viable route ─────────────────────────────────────────────────────
     let wsol = Pubkey::from_str_const(WSOL);
     let tp = Pubkey::from_str_const(TOKEN_PROGRAM);
 
-    for (ri, route) in quote.routes.iter().enumerate() {
+    for (ri, route) in viable_routes.iter().enumerate() {
         let hops_desc: Vec<String> = route.hops.iter().map(|h| format!("{}({})", &h.pool_address[..6], h.dex_name.chars().take(4).collect::<String>())).collect();
         println!("--- Route {} [{}] ---", ri + 1, hops_desc.join(" -> "));
 
@@ -282,7 +300,7 @@ async fn test_dynamic_swap() {
             }
         }
     }
-    println!("\nAll {} routes exhausted.", quote.routes.len());
+    println!("\nAll {} viable routes exhausted ({} total found).", viable_routes.len(), quote.routes.len());
 }
 
 // =========================================================================

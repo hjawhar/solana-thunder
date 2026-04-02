@@ -9,8 +9,11 @@ A Rust DEX aggregator for Solana. Loads all pools across 6 DEX protocols, finds 
 - **On-chain SOL/USD pricing** from Raydium CLMM `sqrt_price_x64` -- no external APIs
 - **Centralized swap instruction builder** for all DEXs with correct Anchor account layouts
 - **Surfpool integration** -- execute real swaps against forked mainnet state, zero cost
-- **On-chain router program** for CPI-based multi-hop swaps
+- **On-chain router program** with exact amount chaining and slippage protection
+- **Parallel pre-fetching** -- CLMM tick arrays and DLMM bitmap extensions fetched in parallel
+- **Route pre-filtering** -- skips routes through pools missing required accounts before trying
 - **Disk cache** -- first load ~4 min from RPC, subsequent loads ~6s from cache
+- **Swap execution in ~40-60s** -- find route, build instructions, execute on Surfpool
 - **Interactive CLI** with progress bars and REPL
 - **Pure DEX library** -- each DEX crate has zero I/O, usable independently
 
