@@ -44,6 +44,7 @@ RPC_URL="https://your-rpc-endpoint.com" ./target/release/thunder-agg
 ### Execute Swaps on Surfpool
 
 Surfpool forks mainnet state locally. Swaps execute against real pool data at zero cost.
+The test automatically finds the optimal route and tries up to 200 routes until one succeeds.
 
 ```bash
 # Install Surfpool
@@ -52,22 +53,44 @@ curl -sL https://run.surfpool.run/ | bash
 # Install Solana CLI (for program deployment)
 sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
 
-# Start Surfpool with mainnet fork
-surfpool start --rpc-url "https://your-rpc-endpoint.com" \
+# Start Surfpool with mainnet fork (reads RPC_URL from .env)
+source .env
+surfpool start --rpc-url "$RPC_URL" \
   --no-tui --no-deploy --no-studio \
-  --airdrop <YOUR_WALLET> --airdrop-amount 100000000000 &
+  --airdrop $(solana address) --airdrop-amount 100000000000 &
+solana -u http://127.0.0.1:8899 airdrop 100 $(solana address)
+```
 
-# Airdrop SOL on local network
-solana -u http://127.0.0.1:8899 airdrop 100 <YOUR_WALLET>
+### Swap Examples
 
-# Build and deploy the router program
-cd crates/router-program && cargo-build-sbf && cd ../..
-solana -u http://127.0.0.1:8899 program deploy \
-  crates/router-program/target/deploy/thunder_router.so \
-  --program-id crates/router-program/target/deploy/thunder_router-keypair.json
+Requires `PRIVATE_KEY` and `RPC_URL` in `.env`, and Surfpool running.
 
-# Run the 2-hop swap test (SOL -> USDC -> TRUMP)
-cargo test --release --test surfpool_swap -- --nocapture
+```bash
+# SOL -> TRUMP
+INPUT=SOL OUTPUT=6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN AMOUNT=0.1 MAX_HOPS=2 \
+  cargo test --release --test surfpool_swap -- --nocapture
+
+# SOL -> BONK
+INPUT=SOL OUTPUT=DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263 AMOUNT=0.01 MAX_HOPS=2 \
+  cargo test --release --test surfpool_swap -- --nocapture
+
+# SOL -> JUP
+INPUT=SOL OUTPUT=JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN AMOUNT=0.01 MAX_HOPS=2 \
+  cargo test --release --test surfpool_swap -- --nocapture
+
+# SOL -> WIF
+INPUT=SOL OUTPUT=EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm AMOUNT=0.01 MAX_HOPS=2 \
+  cargo test --release --test surfpool_swap -- --nocapture
+```
+
+Output shows before/after balance diff:
+```
+  SWAP SUCCEEDED!
+  Signature: 2x67gNgz...
+  ┌─────────────────────────────────────────┐
+  │  SOL   : -0.010005 (299.0834 -> 299.0734)
+  │  Token : +4.455353 (4.455353 -> 8.910706)
+  └─────────────────────────────────────────┘
 ```
 
 ### Configuration
@@ -117,7 +140,7 @@ Pool cache / RPC  -->  PoolIndex (2M pools, token graph)
 ```
 solana-thunder/
 +-- crates/
-|   +-- core/                       Market trait, SwapArgs, constants
+|   +-- core/                       Market trait, shared types, constants
 |   +-- raydium-amm-v4/            RaydiumAMMV4 + RaydiumAmmV4Market
 |   +-- raydium-clmm/              RaydiumCLMMPool + RaydiumClmmMarket
 |   +-- meteora-damm/              MeteoraDAMMMarket + V2Market + models

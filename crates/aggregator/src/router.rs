@@ -158,19 +158,19 @@ impl<'a> Router<'a> {
             return;
         }
 
-        let Some((a1, mid_amount)) = best_pool(self.index, &leg1, *input, amount_in) else {
-            return;
-        };
-        let Some((a2, _)) = best_pool(self.index, &leg2, *mid, mid_amount) else {
-            return;
-        };
-
-        if let Some(route) = simulate_path(
-            self.index,
-            &[(a1, *input, *mid), (a2, *mid, *output)],
-            amount_in,
-        ) {
-            out.push(route);
+        // Try top N pools per leg to find viable routes (not just the single best).
+        let top_leg1 = top_pools(self.index, &leg1, *input, amount_in, 3);
+        for (a1, mid_amount) in &top_leg1 {
+            let top_leg2 = top_pools(self.index, &leg2, *mid, *mid_amount, 3);
+            for (a2, _) in &top_leg2 {
+                if let Some(route) = simulate_path(
+                    self.index,
+                    &[(a1.clone(), *input, *mid), (a2.clone(), *mid, *output)],
+                    amount_in,
+                ) {
+                    out.push(route);
+                }
+            }
         }
     }
 
@@ -554,4 +554,25 @@ fn best_pool(
             Some((addr.clone(), hop.output_amount))
         })
         .max_by_key(|(_, out)| *out)
+}
+
+
+/// Return the top N pools by output amount.
+fn top_pools(
+    index: &PoolIndex,
+    pool_addresses: &[String],
+    input_mint: Pubkey,
+    amount_in: u64,
+    n: usize,
+) -> Vec<(String, u64)> {
+    let mut candidates: Vec<(String, u64)> = pool_addresses
+        .iter()
+        .filter_map(|addr| {
+            let hop = simulate_hop(index, addr, input_mint, amount_in)?;
+            Some((addr.clone(), hop.output_amount))
+        })
+        .collect();
+    candidates.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+    candidates.truncate(n);
+    candidates
 }

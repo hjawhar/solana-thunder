@@ -17,6 +17,7 @@ use thunder_core::GenericError;
 
 const DLMM_PROGRAM: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
 const DLMM_SWAP_DISC: [u8; 8] = [65, 75, 63, 76, 235, 91, 91, 136];
+const DLMM_SWAP_V1_DISC: [u8; 8] = [248, 198, 158, 145, 225, 117, 135, 200]; // older 'swap' (no bitmap ext)
 const DLMM_EVENT_AUTHORITY: &str = "D1ZN9Wj1fRSUQfCjhvnu1hqDMT7hzjzBBpi12nVniYD6";
 const MEMO_PROGRAM: &str = "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr";
 
@@ -78,6 +79,48 @@ pub fn build_dlmm_swap(
     data.extend_from_slice(&amount_in.to_le_bytes());
     data.extend_from_slice(&min_amount_out.to_le_bytes());
     data.extend_from_slice(&0u32.to_le_bytes()); // empty Vec
+
+    Ok(Instruction { program_id: dlmm, accounts: keys, data })
+}
+
+/// Build a DLMM swap using the older 'swap' instruction (no bitmap extension required).
+/// Use this for pools that don't have a bitmap extension account.
+pub fn build_dlmm_swap_v1(
+    accounts: &DlmmSwapAccounts,
+    amount_in: u64,
+    min_amount_out: u64,
+) -> Result<Instruction, GenericError> {
+    let dlmm = Pubkey::from_str_const(DLMM_PROGRAM);
+
+    let (oracle, _) = Pubkey::find_program_address(
+        &[b"oracle", accounts.pool.as_ref()],
+        &dlmm,
+    );
+
+    // The older 'swap' instruction has a simpler layout:
+    // 0: lb_pair, 1: reserve_x, 2: reserve_y, 3: user_token_in, 4: user_token_out,
+    // 5: token_x_mint, 6: token_y_mint, 7: oracle, 8: host_fee(None), 9: user,
+    // 10: token_x_program, 11: token_y_program, remaining: bin_array(s)
+    let keys = vec![
+        AccountMeta::new(accounts.pool, false),
+        AccountMeta::new(accounts.reserve_x, false),
+        AccountMeta::new(accounts.reserve_y, false),
+        AccountMeta::new(accounts.user_token_in, false),
+        AccountMeta::new(accounts.user_token_out, false),
+        AccountMeta::new_readonly(accounts.token_x_mint, false),
+        AccountMeta::new_readonly(accounts.token_y_mint, false),
+        AccountMeta::new(oracle, false),
+        AccountMeta::new_readonly(dlmm, false),  // host_fee = None
+        AccountMeta::new(accounts.user, true),
+        AccountMeta::new_readonly(accounts.token_x_program, false),
+        AccountMeta::new_readonly(accounts.token_y_program, false),
+        AccountMeta::new(accounts.bin_array, false),  // remaining[0]
+    ];
+
+    let mut data = Vec::with_capacity(24);
+    data.extend_from_slice(&DLMM_SWAP_V1_DISC);
+    data.extend_from_slice(&amount_in.to_le_bytes());
+    data.extend_from_slice(&min_amount_out.to_le_bytes());
 
     Ok(Instruction { program_id: dlmm, accounts: keys, data })
 }

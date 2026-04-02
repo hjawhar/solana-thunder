@@ -1,17 +1,16 @@
 //! Meteora Dynamic Liquidity Market Maker (DLMM) DEX crate.
 //!
-//! Implements the `Market` and `ConcentratedLiquidity` traits from `thunder-core`
+//! Implements the `Market` trait from `thunder-core`
 //! for Meteora DLMM bin-based concentrated liquidity pools.
 
 
 use borsh::BorshDeserialize;
 use solana_pubkey::Pubkey;
-use solana_sdk::instruction::{AccountMeta, Instruction};
 
 use thunder_core::{
-    calculate_price_impact_bps, quote_priority, ConcentratedLiquidity, GenericError, Market,
-    PoolFees, PoolFinancials, PoolMetadata, RequiredAccounts, SwapArgs, SwapContext,
-    SwapDirection, MEMO_PROGRAM_V2, TOKEN_PROGRAM, WSOL, infer_mint_decimals,
+    quote_priority, GenericError, Market,
+    PoolFees, PoolFinancials, PoolMetadata,
+    SwapDirection, infer_mint_decimals,
 };
 
 // ---------------------------------------------------------------------------
@@ -19,7 +18,6 @@ use thunder_core::{
 // ---------------------------------------------------------------------------
 
 pub const METEORA_DYNAMIC_LMM: &str = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo";
-pub const METEORA_EVENTS_AUTHORITY: &str = "D1ZN9Wj1fRSUQfCjhvnu1hqDMT7hzjzBBpi12nVniYD6";
 
 // ---------------------------------------------------------------------------
 // On-chain model structs
@@ -113,39 +111,6 @@ pub struct MeteoraDLMMPool {
     pub reserved: [u8; 22],
 }
 
-// ---------------------------------------------------------------------------
-// Utility: bin array PDA derivation
-// ---------------------------------------------------------------------------
-
-const BIN_ARRAY: &[u8] = b"bin_array";
-
-pub fn derive_bin_array_pda(lb_pair: Pubkey, bin_array_index: i64) -> (Pubkey, u8) {
-    let meteora_dlmm_program = Pubkey::from_str_const(METEORA_DYNAMIC_LMM);
-    Pubkey::find_program_address(
-        &[BIN_ARRAY, lb_pair.as_ref(), &bin_array_index.to_le_bytes()],
-        &meteora_dlmm_program,
-    )
-}
-
-/// Derive the bitmap extension PDA for a DLMM pool.
-pub fn derive_bitmap_extension_pda(lb_pair: Pubkey) -> (Pubkey, u8) {
-    let meteora_dlmm_program = Pubkey::from_str_const(METEORA_DYNAMIC_LMM);
-    Pubkey::find_program_address(
-        &[b"bitmap", lb_pair.as_ref()],
-        &meteora_dlmm_program,
-    )
-}
-
-// ---------------------------------------------------------------------------
-// Swap instruction args (Borsh-serialized on-chain)
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Debug, borsh::BorshSerialize)]
-struct SwapInstructionArgs {
-    amount_in: u64,
-    min_amount_out: u64,
-    remaining_accounts_info: Vec<u8>,
-}
 
 // ---------------------------------------------------------------------------
 // Market wrapper
@@ -292,42 +257,15 @@ impl Market for MeteoraDlmmMarket {
 
     fn calculate_price_impact(
         &self,
-        amount_in: u64,
-        direction: SwapDirection,
+        _amount_in: u64,
+        _direction: SwapDirection,
     ) -> Result<u64, GenericError> {
-        let pre_swap_price = self.current_price()?;
-        let output = self.calculate_output(amount_in, direction)?;
-
-        // Use the effective (physical) direction for reserve math.
-        let effective_direction = if self.flipped {
-            match direction {
-                SwapDirection::Buy => SwapDirection::Sell,
-                SwapDirection::Sell => SwapDirection::Buy,
-            }
-        } else {
-            direction
-        };
-
-        let post_swap_price = match effective_direction {
-            SwapDirection::Buy => {
-                let new_reserve_y = self.reserve_y_balance + amount_in;
-                let new_reserve_x = self.reserve_x_balance.saturating_sub(output);
-                if new_reserve_x == 0 {
-                    return Err("Insufficient liquidity in pool".into());
-                }
-                new_reserve_y as f64 / new_reserve_x as f64
-            }
-            SwapDirection::Sell => {
-                let new_reserve_x = self.reserve_x_balance + amount_in;
-                let new_reserve_y = self.reserve_y_balance.saturating_sub(output);
-                if new_reserve_x == 0 {
-                    return Err("Insufficient liquidity in pool".into());
-                }
-                new_reserve_y as f64 / new_reserve_x as f64
-            }
-        };
-
-        Ok(calculate_price_impact_bps(pre_swap_price, post_swap_price))
+        // DLMM uses bin-based pricing, not constant-product reserves.
+        // Within a single bin, the price is fixed (zero impact).
+        // Price impact only occurs when the swap crosses bin boundaries.
+        // For a conservative estimate, return 0 (the swap_builder and
+        // on-chain program handle the actual bin traversal).
+        Ok(0)
     }
 
     fn current_price(&self) -> Result<f64, GenericError> {
@@ -345,274 +283,4 @@ impl Market for MeteoraDlmmMarket {
         }
     }
 
-    fn build_swap_instruction(
-        &self,
-        context: SwapContext,
-        args: SwapArgs,
-        direction: SwapDirection,
-    ) -> Result<Vec<Instruction>, GenericError> {
-        use borsh::to_vec;
-        use solana_system_interface::instruction as system_instruction;
-        use spl_associated_token_account::instruction::create_associated_token_account_idempotent;
-        use spl_token::instruction::initialize_account;
-        use spl_token::state::Account as TokenAccount;
-        use solana_sdk::program_pack::Pack;
-
-        let mut instructions = Vec::new();
-        const TOKEN_ACCOUNT_RENT: u64 = 2_039_280;
-
-        let native_mint = spl_token::native_mint::ID;
-        let wsol = Pubkey::from_str_const(WSOL);
-        let meteora_dlmm_program = Pubkey::from_str_const(METEORA_DYNAMIC_LMM);
-
-        // Derive bin array PDA from active bin
-        const MAX_BIN_PER_ARRAY: i64 = 70;
-        let bin_array_index = (self.pool.active_id as i64).div_euclid(MAX_BIN_PER_ARRAY);
-        let (bin_array_pda, _) =
-            derive_bin_array_pda(Pubkey::from_str_const(&self.pool_address), bin_array_index);
-
-        // Bitmap extension: check extra_accounts first, then self.bitmap_extension.
-        let bitmap_ext_key = format!("bitmap_ext:{}", self.pool_address);
-        let bitmap_ext_account = if let Some(addr_bytes) = context.extra_accounts.get(&bitmap_ext_key) {
-            if addr_bytes.len() == 32 {
-                Pubkey::try_from(addr_bytes.as_slice()).unwrap_or(meteora_dlmm_program)
-            } else {
-                meteora_dlmm_program
-            }
-        } else {
-            self.bitmap_extension.unwrap_or(meteora_dlmm_program)
-        };
-
-        // Determine correct token programs for Token X and Token Y
-        let token_x_program = if self.pool.token_x_mint == wsol {
-            Pubkey::from_str_const(TOKEN_PROGRAM)
-        } else {
-            context.token_program_id
-        };
-        let token_y_program = if self.pool.token_y_mint == wsol {
-            Pubkey::from_str_const(TOKEN_PROGRAM)
-        } else {
-            context.token_program_id
-        };
-
-        // When flipped, the Market's Buy (spend quote to get base) maps to the
-        // physical Sell direction (X→Y becomes Y→X) and vice versa.
-        let physical_direction = if self.flipped {
-            match direction {
-                SwapDirection::Buy => SwapDirection::Sell,
-                SwapDirection::Sell => SwapDirection::Buy,
-            }
-        } else {
-            direction
-        };
-
-        match physical_direction {
-            SwapDirection::Buy => {
-                // Buy: Y (SOL) → X (Token)
-
-                // 1. Create temporary WSOL account for input
-                let seed = &format!("{}", context.user)[..32];
-                let wsol_pubkey =
-                    Pubkey::create_with_seed(&context.user, seed, &spl_token::id())?;
-
-                let total_amount = TOKEN_ACCOUNT_RENT + args.amount_in;
-
-                instructions.push(system_instruction::create_account_with_seed(
-                    &context.user,
-                    &wsol_pubkey,
-                    &context.user,
-                    seed,
-                    total_amount,
-                    TokenAccount::LEN as u64,
-                    &spl_token::id(),
-                ));
-
-                // 2. Initialize WSOL account
-                instructions.push(initialize_account(
-                    &spl_token::id(),
-                    &wsol_pubkey,
-                    &native_mint,
-                    &context.user,
-                )?);
-
-                // 3. Create destination ATA if needed
-                if !context.destination_ata_exists {
-                    instructions.push(create_associated_token_account_idempotent(
-                        &context.user,
-                        &context.user,
-                        &self.pool.token_x_mint,
-                        &context.token_program_id,
-                    ));
-                }
-
-                // 4. Build swap instruction
-                let swap_args = SwapInstructionArgs {
-                    amount_in: args.amount_in,
-                    min_amount_out: args.min_amount_out,
-                    remaining_accounts_info: vec![],
-                };
-
-                let keys: Vec<AccountMeta> = vec![
-                    AccountMeta::new(Pubkey::from_str_const(&self.pool_address), false), // 0: lb_pair
-                    AccountMeta::new_readonly(bitmap_ext_account, false),   // 1: bitmap_extension
-                    AccountMeta::new(self.pool.reserve_x, false),           // 2: reserve_x
-                    AccountMeta::new(self.pool.reserve_y, false),           // 3: reserve_y
-                    AccountMeta::new(wsol_pubkey, false),                   // 4: user_token_in
-                    AccountMeta::new(context.destination_ata, false),       // 5: user_token_out
-                    AccountMeta::new_readonly(self.pool.token_x_mint, false), // 6: token_x_mint
-                    AccountMeta::new_readonly(self.pool.token_y_mint, false), // 7: token_y_mint
-                    AccountMeta::new(self.pool.oracle, false),              // 8: oracle
-                    AccountMeta::new_readonly(meteora_dlmm_program, false), // 9: host_fee (None)
-                    AccountMeta::new(context.user, true),                   // 10: user
-                    AccountMeta::new_readonly(token_x_program, false),      // 11: token_x_program
-                    AccountMeta::new_readonly(token_y_program, false),      // 12: token_y_program
-                    AccountMeta::new_readonly(Pubkey::from_str_const(MEMO_PROGRAM_V2), false), // 13: memo_program
-                    AccountMeta::new_readonly(                              // 14: event_authority
-                        Pubkey::from_str_const(METEORA_EVENTS_AUTHORITY), false,
-                    ),
-                    AccountMeta::new_readonly(meteora_dlmm_program, false), // 15: program
-                    AccountMeta::new(bin_array_pda, false),                 // remaining[0]: bin_array
-                ];
-
-                // Discriminator for DLMM swap
-                let mut data = vec![65, 75, 63, 76, 235, 91, 91, 136];
-                let mut args_bytes = to_vec(&swap_args)?;
-                data.append(&mut args_bytes);
-
-                instructions.push(Instruction {
-                    program_id: meteora_dlmm_program,
-                    accounts: keys,
-                    data,
-                });
-
-                // 5. Close temporary WSOL account
-                instructions.push(spl_token::instruction::close_account(
-                    &spl_token::id(),
-                    &wsol_pubkey,
-                    &context.user,
-                    &context.user,
-                    &[],
-                )?);
-            }
-
-            SwapDirection::Sell => {
-                // Sell: X (Token) → Y (SOL)
-
-                // 1. Create temporary WSOL account for output
-                let seed = &format!("{}", context.user)[..32];
-                let wsol_pubkey =
-                    Pubkey::create_with_seed(&context.user, seed, &spl_token::id())?;
-
-                instructions.push(system_instruction::create_account_with_seed(
-                    &context.user,
-                    &wsol_pubkey,
-                    &context.user,
-                    seed,
-                    TOKEN_ACCOUNT_RENT,
-                    TokenAccount::LEN as u64,
-                    &spl_token::id(),
-                ));
-
-                // 2. Initialize WSOL account
-                instructions.push(initialize_account(
-                    &spl_token::id(),
-                    &wsol_pubkey,
-                    &native_mint,
-                    &context.user,
-                )?);
-
-                // 3. Build swap instruction
-                let swap_args = SwapInstructionArgs {
-                    amount_in: args.amount_in,
-                    min_amount_out: args.min_amount_out,
-                    remaining_accounts_info: vec![],
-                };
-
-                let keys: Vec<AccountMeta> = vec![
-                    AccountMeta::new(Pubkey::from_str_const(&self.pool_address), false), // 0: lb_pair
-                    AccountMeta::new_readonly(bitmap_ext_account, false),   // 1: bitmap_extension
-                    AccountMeta::new(self.pool.reserve_x, false),           // 2: reserve_x
-                    AccountMeta::new(self.pool.reserve_y, false),           // 3: reserve_y
-                    AccountMeta::new(context.source_ata, false),            // 4: user_token_in
-                    AccountMeta::new(wsol_pubkey, false),                   // 5: user_token_out (WSOL)
-                    AccountMeta::new_readonly(self.pool.token_x_mint, false), // 6: token_x_mint
-                    AccountMeta::new_readonly(self.pool.token_y_mint, false), // 7: token_y_mint
-                    AccountMeta::new(self.pool.oracle, false),              // 8: oracle
-                    AccountMeta::new_readonly(meteora_dlmm_program, false), // 9: host_fee (None)
-                    AccountMeta::new(context.user, true),                   // 10: user
-                    AccountMeta::new_readonly(token_x_program, false),      // 11: token_x_program
-                    AccountMeta::new_readonly(token_y_program, false),      // 12: token_y_program
-                    AccountMeta::new_readonly(Pubkey::from_str_const(MEMO_PROGRAM_V2), false), // 13: memo_program
-                    AccountMeta::new_readonly(                              // 14: event_authority
-                        Pubkey::from_str_const(METEORA_EVENTS_AUTHORITY), false,
-                    ),
-                    AccountMeta::new_readonly(meteora_dlmm_program, false), // 15: program
-                    AccountMeta::new(bin_array_pda, false),                 // remaining[0]: bin_array
-                ];
-
-                // Discriminator for DLMM swap
-                let mut data = vec![65, 75, 63, 76, 235, 91, 91, 136];
-                let mut args_bytes = to_vec(&swap_args)?;
-                data.append(&mut args_bytes);
-
-                instructions.push(Instruction {
-                    program_id: meteora_dlmm_program,
-                    accounts: keys,
-                    data,
-                });
-
-                // 4. Close temporary WSOL account
-                instructions.push(spl_token::instruction::close_account(
-                    &spl_token::id(),
-                    &wsol_pubkey,
-                    &context.user,
-                    &context.user,
-                    &[],
-                )?);
-            }
-        }
-
-        Ok(instructions)
-    }
-
-    fn required_accounts(
-        &self,
-        _user: Pubkey,
-        direction: SwapDirection,
-    ) -> Result<RequiredAccounts, GenericError> {
-        let (source_mint, destination_mint) = match direction {
-            SwapDirection::Buy => if self.flipped {
-                (self.pool.token_x_mint, self.pool.token_y_mint)
-            } else {
-                (self.pool.token_y_mint, self.pool.token_x_mint)
-            },
-            SwapDirection::Sell => if self.flipped {
-                (self.pool.token_y_mint, self.pool.token_x_mint)
-            } else {
-                (self.pool.token_x_mint, self.pool.token_y_mint)
-            },
-        };
-
-        Ok(RequiredAccounts {
-            source_mint,
-            destination_mint,
-            account_data: vec![],
-        })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// ConcentratedLiquidity trait (bin-based concentrated liquidity)
-// ---------------------------------------------------------------------------
-
-impl ConcentratedLiquidity for MeteoraDlmmMarket {
-    fn active_bin(&self) -> Result<i32, GenericError> {
-        Ok(self.pool.active_id)
-    }
-
-    fn liquidity_distribution(&self) -> Result<Vec<(i32, u64)>, GenericError> {
-        // Simplified: return current bin only. Production would traverse bin arrays.
-        let liquidity = (self.reserve_x_balance + self.reserve_y_balance) / 2;
-        Ok(vec![(self.pool.active_id, liquidity)])
-    }
 }

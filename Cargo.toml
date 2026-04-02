@@ -38,6 +38,8 @@ solana-system-interface = { workspace = true }
 spl-associated-token-account = { workspace = true }
 spl-token = { workspace = true }
 bincode = "1.3"
+solana-rpc-client-api = "3.0"
+solana-account-decoder-client-types = "3.0"
 
 # Geyser streaming
 yellowstone-grpc-client = "11.0"

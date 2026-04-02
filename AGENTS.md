@@ -62,7 +62,7 @@ solana-thunder/
 +-- src/lib.rs                          # Root crate: re-exports all DEX crates
 +-- crates/
 |   +-- core/src/
-|   |   +-- traits.rs                   # Market trait, SwapArgs, SwapContext, is_active()
+|   |   +-- traits.rs                   # Market trait, PoolMetadata, PoolFinancials, is_active()
 |   |   +-- constants.rs                # WSOL, USDC, USDT, quote_priority, infer_mint_decimals
 |   +-- raydium-amm-v4/src/lib.rs       # RaydiumAMMV4 + RaydiumAmmV4Market
 |   +-- raydium-clmm/src/
@@ -90,9 +90,11 @@ solana-thunder/
 |   +-- router-program/                # On-chain router (excluded from workspace)
 |       +-- src/lib.rs                  # CPI multi-hop swap program
 +-- tests/
-    +-- surfpool_swap.rs                # 2-hop swap test on Surfpool (SOL->USDC->TRUMP)
+    +-- surfpool_swap.rs                # Dynamic multi-hop swap on Surfpool (any token pair)
     +-- trade_stream.rs                 # Live DEX swap streaming via Yellowstone gRPC
     +-- creation_stream.rs              # Live token + pool creation streaming
+    +-- pool_financials.rs              # Live pool update streaming
+    +-- validate_prices.rs              # Price validation across DEXs
 ```
 
 ## Development Commands
@@ -106,8 +108,29 @@ cargo build --release -p thunder-aggregator  # Build aggregator binary
 # Run aggregator CLI
 RPC_URL="https://..." cargo run --release -p thunder-aggregator
 
-# Run Surfpool swap test
-cargo test --release --test surfpool_swap -- --nocapture
+# Run Surfpool swap test (any token)
+INPUT=SOL OUTPUT=6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN AMOUNT=0.1 MAX_HOPS=2 \
+  cargo test --release --test surfpool_swap -- --nocapture
+```
+
+### Swap Examples
+
+```bash
+# SOL -> TRUMP
+INPUT=SOL OUTPUT=6p6xgHyF7AeE6TZkSmFsko444wqoP15icUSqi2jfGiPN AMOUNT=0.1 MAX_HOPS=2 \
+  cargo test --release --test surfpool_swap -- --nocapture
+
+# SOL -> BONK
+INPUT=SOL OUTPUT=DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263 AMOUNT=0.01 MAX_HOPS=2 \
+  cargo test --release --test surfpool_swap -- --nocapture
+
+# SOL -> JUP
+INPUT=SOL OUTPUT=JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN AMOUNT=0.01 MAX_HOPS=2 \
+  cargo test --release --test surfpool_swap -- --nocapture
+
+# SOL -> WIF
+INPUT=SOL OUTPUT=EKpQGSJtjMFqKZ9KQanSqYXRcF8fBopzLHYxdM65zcjm AMOUNT=0.01 MAX_HOPS=2 \
+  cargo test --release --test surfpool_swap -- --nocapture
 ```
 
 ### Surfpool Setup
@@ -221,9 +244,9 @@ let ix = swap_builder::build_clmm_swap(&ClmmSwapAccounts { ... }, amount, min_ou
 | `crates/aggregator/src/cache.rs` | Disk cache: save/load 2M pools as bincode (~1.6 GB) |
 | `crates/aggregator/src/router.rs` | Multi-hop route finding (1-4 hops, bidirectional) |
 | `crates/aggregator/src/price.rs` | SOL/USD on-chain via CLMM sqrt_price |
-| `crates/core/src/traits.rs` | Market trait, SwapArgs, is_active() |
+| `crates/core/src/traits.rs` | Market trait, PoolMetadata, PoolFinancials, is_active() |
 | `crates/router-program/src/lib.rs` | On-chain CPI router program |
-| `tests/surfpool_swap.rs` | 2-hop swap test on Surfpool |
+| `tests/surfpool_swap.rs` | Dynamic multi-hop swap on Surfpool (SOL -> any token, auto-routing) |
 
 ## Runtime / Tooling
 
