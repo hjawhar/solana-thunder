@@ -191,11 +191,85 @@ pub fn build_damm_v1_swap(
     Ok(Instruction { program_id: program, accounts: keys, data })
 }
 
+pub fn build_damm_v1_swap_from_pool_data(
+    pool_address: Pubkey,
+    pool_data: &[u8],
+    user: Pubkey,
+    user_token_in: Pubkey,
+    user_token_out: Pubkey,
+    input_mint: Pubkey,
+    amount_in: u64,
+    min_amount_out: u64,
+) -> Result<Instruction, GenericError> {
+    if pool_data.len() < 298 {
+        return Err(format!(
+            "DAMM V1 pool data too short: {} bytes, need at least 298", pool_data.len()
+        ).into());
+    }
+
+    let token_a_mint = Pubkey::new_from_array(pool_data[40..72].try_into().unwrap());
+    let token_b_mint = Pubkey::new_from_array(pool_data[72..104].try_into().unwrap());
+    let a_vault = Pubkey::new_from_array(pool_data[104..136].try_into().unwrap());
+    let b_vault = Pubkey::new_from_array(pool_data[136..168].try_into().unwrap());
+    let a_vault_lp = Pubkey::new_from_array(pool_data[168..200].try_into().unwrap());
+    let b_vault_lp = Pubkey::new_from_array(pool_data[200..232].try_into().unwrap());
+    let protocol_token_a_fee = Pubkey::new_from_array(pool_data[234..266].try_into().unwrap());
+    let protocol_token_b_fee = Pubkey::new_from_array(pool_data[266..298].try_into().unwrap());
+
+    if input_mint != token_a_mint && input_mint != token_b_mint {
+        return Err(format!(
+            "input_mint {} matches neither token_a {} nor token_b {} in DAMM V1 pool {}",
+            input_mint, token_a_mint, token_b_mint, pool_address
+        ).into());
+    }
+
+    // Fee account is for the OUTPUT token direction.
+    // Selling token_a → output is token_b → protocol_token_b_fee.
+    // Selling token_b → output is token_a → protocol_token_a_fee.
+    let protocol_token_fee = if input_mint == token_b_mint {
+        protocol_token_a_fee
+    } else {
+        protocol_token_b_fee
+    };
+
+    let vault_program = Pubkey::from_str_const("24Uqj9JCLxUeoC3hGfh5W3s9FM9uCHqSim67FNPDFSms");
+    let a_token_vault = Pubkey::find_program_address(&[b"token_vault", a_vault.as_ref()], &vault_program).0;
+    let b_token_vault = Pubkey::find_program_address(&[b"token_vault", b_vault.as_ref()], &vault_program).0;
+    let a_vault_lp_mint = Pubkey::find_program_address(&[b"lp_mint", a_vault.as_ref()], &vault_program).0;
+    let b_vault_lp_mint = Pubkey::find_program_address(&[b"lp_mint", b_vault.as_ref()], &vault_program).0;
+
+    let token_program = Pubkey::from_str_const("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+
+    build_damm_v1_swap(
+        &DammV1SwapAccounts {
+            pool: pool_address,
+            a_vault,
+            b_vault,
+            a_token_vault,
+            b_token_vault,
+            a_vault_lp_mint,
+            b_vault_lp_mint,
+            a_vault_lp,
+            b_vault_lp,
+            protocol_token_fee,
+            user_token_in,
+            user_token_out,
+            user,
+            token_program,
+        },
+        amount_in,
+        min_amount_out,
+    )
+}
+
 // =========================================================================
-// Meteora DAMM V2 — Swap
+// Meteora DAMM V2 — Swap2
 // =========================================================================
 
 const DAMM_V2_PROGRAM: &str = "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG";
+/// Pool authority PDA (hardcoded, same for all CPAMM V2 pools).
+const DAMM_V2_POOL_AUTHORITY: &str = "HLnpSz9h2S4hiLQ43rnSD9XkcUThA7B8hQMKmDaiTLcC";
+/// `swap` discriminator (still used on-chain despite docs saying deprecated).
 const DAMM_V2_SWAP_DISC: [u8; 8] = [248, 198, 158, 145, 225, 117, 135, 200];
 
 pub struct DammV2SwapAccounts {
@@ -217,22 +291,25 @@ pub fn build_damm_v2_swap(
     min_amount_out: u64,
 ) -> Result<Instruction, GenericError> {
     let program = Pubkey::from_str_const(DAMM_V2_PROGRAM);
+    let pool_authority = Pubkey::from_str_const(DAMM_V2_POOL_AUTHORITY);
     let (event_authority, _) = Pubkey::find_program_address(&[b"__event_authority"], &program);
 
+    // Account layout from real on-chain swap transactions.
     let keys = vec![
-        AccountMeta::new(accounts.pool, false),                   // 0: pool
-        AccountMeta::new(accounts.token_a_vault, false),           // 1
-        AccountMeta::new(accounts.token_b_vault, false),           // 2
-        AccountMeta::new(accounts.token_a_mint, false),            // 3
-        AccountMeta::new(accounts.token_b_mint, false),            // 4
-        AccountMeta::new(accounts.user_token_in, false),           // 5
-        AccountMeta::new(accounts.user_token_out, false),          // 6
-        AccountMeta::new(accounts.user, true),                     // 7: user
-        AccountMeta::new_readonly(accounts.token_a_program, false), // 8
-        AccountMeta::new_readonly(accounts.token_b_program, false), // 9
-        AccountMeta::new_readonly(program, false),                 // 10: program
-        AccountMeta::new_readonly(event_authority, false),         // 11: event_authority
-        AccountMeta::new_readonly(program, false),                 // 12: program (again, Anchor pattern)
+        AccountMeta::new_readonly(pool_authority, false),             // 0: pool_authority
+        AccountMeta::new(accounts.pool, false),                      // 1: pool
+        AccountMeta::new(accounts.user_token_in, false),             // 2: input_token_account
+        AccountMeta::new(accounts.user_token_out, false),            // 3: output_token_account
+        AccountMeta::new(accounts.token_a_vault, false),             // 4: token_a_vault
+        AccountMeta::new(accounts.token_b_vault, false),             // 5: token_b_vault
+        AccountMeta::new_readonly(accounts.token_a_mint, false),     // 6: token_a_mint
+        AccountMeta::new_readonly(accounts.token_b_mint, false),     // 7: token_b_mint
+        AccountMeta::new(accounts.user, true),                      // 8: payer (signer)
+        AccountMeta::new_readonly(accounts.token_a_program, false),  // 9: token_a_program
+        AccountMeta::new_readonly(accounts.token_b_program, false),  // 10: token_b_program
+        AccountMeta::new_readonly(program, false),                  // 11: program
+        AccountMeta::new_readonly(event_authority, false),          // 12: event_authority
+        AccountMeta::new_readonly(program, false),                  // 13: program
     ];
 
     let mut data = Vec::with_capacity(24);
@@ -272,6 +349,7 @@ pub fn build_clmm_swap(
     amount_in: u64,
     min_amount_out: u64,
     sqrt_price_limit: u128,
+    exact_output: bool,
 ) -> Result<Instruction, GenericError> {
     let program = Pubkey::from_str_const(CLMM_PROGRAM);
 
@@ -297,12 +375,21 @@ pub fn build_clmm_swap(
     }
 
     // Data: disc(8) + amount(u64) + other_amount_threshold(u64) + sqrt_price_limit_x64(u128) + is_base_input(bool)
+    //
+    // exact_output=false (ExactIn):  is_base_input=true,  amount=input,      threshold=min_output
+    // exact_output=true  (ExactOut): is_base_input=false, amount=exact_output, threshold=max_input
+    let (amount, threshold, is_base_input) = if exact_output {
+        (min_amount_out, amount_in, false)
+    } else {
+        (amount_in, min_amount_out, true)
+    };
+
     let mut data = Vec::with_capacity(41);
     data.extend_from_slice(&CLMM_SWAP_DISC);
-    data.extend_from_slice(&amount_in.to_le_bytes());
-    data.extend_from_slice(&min_amount_out.to_le_bytes());
+    data.extend_from_slice(&amount.to_le_bytes());
+    data.extend_from_slice(&threshold.to_le_bytes());
     data.extend_from_slice(&sqrt_price_limit.to_le_bytes());
-    data.push(1u8); // is_base_input = true (exact input mode)
+    data.push(is_base_input as u8);
 
     Ok(Instruction { program_id: program, accounts: keys, data })
 }
@@ -327,6 +414,7 @@ pub fn build_ray_v4_swap(
     accounts: &RayV4SwapAccounts,
     amount_in: u64,
     min_amount_out: u64,
+    exact_output: bool,
 ) -> Result<Instruction, GenericError> {
     let program = Pubkey::from_str_const(RAY_V4_PROGRAM);
     let authority = Pubkey::from_str_const(RAY_V4_AUTHORITY);
@@ -352,9 +440,12 @@ pub fn build_ray_v4_swap(
         AccountMeta::new(accounts.user, true),                 // 16: user_owner
     ];
 
-    // Data: disc(1) + amount_in(u64) + min_amount_out(u64)
+    // disc 9 = swap_base_in (exact input), disc 11 = swap_base_out (exact output).
+    // Same struct layout {amount_in, min_amount_out} but with swapped semantics:
+    //   swap_base_out: amount_in = max SOL to spend, min_amount_out = exact tokens to receive.
+    let disc: u8 = if exact_output { 11 } else { 9 };
     let mut data = Vec::with_capacity(17);
-    data.push(9u8); // swap_base_in discriminator
+    data.push(disc);
     data.extend_from_slice(&amount_in.to_le_bytes());
     data.extend_from_slice(&min_amount_out.to_le_bytes());
 
@@ -507,6 +598,7 @@ pub fn build_clmm_swap_from_pool_data(
     tick_arrays: Vec<Pubkey>,
     amount_in: u64,
     min_amount_out: u64,
+    exact_output: bool,
 ) -> Result<Instruction, GenericError> {
     if pool_data.len() < 233 {
         return Err(format!(
@@ -558,5 +650,267 @@ pub fn build_clmm_swap_from_pool_data(
         amount_in,
         min_amount_out,
         0u128, // sqrt_price_limit = 0 means no limit
+        exact_output,
     )
+}
+
+
+// =========================================================================
+// Meteora DAMM V2 — from pool data
+// =========================================================================
+
+/// Build a DAMM V2 swap instruction from raw on-chain pool account bytes.
+pub fn build_damm_v2_swap_from_pool_data(
+    pool_address: Pubkey,
+    pool_data: &[u8],
+    user: Pubkey,
+    user_token_in: Pubkey,
+    user_token_out: Pubkey,
+    input_mint: Pubkey,
+    _in_program: Pubkey,
+    _out_program: Pubkey,
+    amount_in: u64,
+    min_amount_out: u64,
+) -> Result<Instruction, GenericError> {
+    if pool_data.len() < 492 {
+        return Err(format!(
+            "DAMM V2 pool data too short: {} bytes, need at least 492", pool_data.len()
+        ).into());
+    }
+
+    let token_a_mint = Pubkey::new_from_array(pool_data[168..200].try_into().unwrap());
+    let token_b_mint = Pubkey::new_from_array(pool_data[200..232].try_into().unwrap());
+    let token_a_vault = Pubkey::new_from_array(pool_data[232..264].try_into().unwrap());
+    let token_b_vault = Pubkey::new_from_array(pool_data[264..296].try_into().unwrap());
+
+    // Token program flags: 0 = Token Program, 1 = Token-2022.
+    // token_a_flag @ struct offset 474, raw offset 482.
+    // token_b_flag @ struct offset 475, raw offset 483.
+    let tp = Pubkey::from_str_const("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+    let tp22 = Pubkey::from_str_const("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
+    let token_a_program = if pool_data[482] == 1 { tp22 } else { tp };
+    let token_b_program = if pool_data[483] == 1 { tp22 } else { tp };
+
+    if input_mint != token_a_mint && input_mint != token_b_mint {
+        return Err(format!(
+            "input_mint {} matches neither token_a {} nor token_b {} in DAMM V2 pool {}",
+            input_mint, token_a_mint, token_b_mint, pool_address
+        ).into());
+    };
+
+    build_damm_v2_swap(
+        &DammV2SwapAccounts {
+            pool: pool_address,
+            token_a_vault,
+            token_b_vault,
+            token_a_mint,
+            token_b_mint,
+            user_token_in,
+            user_token_out,
+            user,
+            token_a_program,
+            token_b_program,
+        },
+        amount_in,
+        min_amount_out,
+    )
+}
+
+// =========================================================================
+// Raydium AMM V4 — from pool data
+// =========================================================================
+
+/// Build a Raydium V4 swap instruction from raw on-chain pool account bytes.
+/// Note: Raydium V4 has NO Anchor discriminator — fields start at byte 0.
+pub fn build_ray_v4_swap_from_pool_data(
+    pool_address: Pubkey,
+    pool_data: &[u8],
+    user: Pubkey,
+    user_token_in: Pubkey,
+    user_token_out: Pubkey,
+    input_mint: Pubkey,
+    amount_in: u64,
+    min_amount_out: u64,
+    exact_output: bool,
+) -> Result<Instruction, GenericError> {
+    if pool_data.len() < 464 {
+        return Err(format!(
+            "Raydium V4 pool data too short: {} bytes, need at least 464", pool_data.len()
+        ).into());
+    }
+
+    let base_vault = Pubkey::new_from_array(pool_data[336..368].try_into().unwrap());
+    let quote_vault = Pubkey::new_from_array(pool_data[368..400].try_into().unwrap());
+    let base_mint = Pubkey::new_from_array(pool_data[400..432].try_into().unwrap());
+    let quote_mint = Pubkey::new_from_array(pool_data[432..464].try_into().unwrap());
+
+    // Verify input_mint matches one of the pool's mints.
+    if input_mint != base_mint && input_mint != quote_mint {
+        return Err(format!(
+            "input_mint {} matches neither base {} nor quote {} in V4 pool {}",
+            input_mint, base_mint, quote_mint, pool_address
+        ).into());
+    }
+
+    build_ray_v4_swap(
+        &RayV4SwapAccounts {
+            pool: pool_address,
+            base_vault,
+            quote_vault,
+            user_token_in,
+            user_token_out,
+            user,
+        },
+        amount_in,
+        min_amount_out,
+        exact_output,
+    )
+}
+
+// =========================================================================
+// Pumpfun AMM — from pool data
+// =========================================================================
+
+/// Build a Pumpfun swap instruction from raw on-chain pool account bytes.
+pub fn build_pumpfun_swap_from_pool_data(
+    pool_address: Pubkey,
+    pool_data: &[u8],
+    user: Pubkey,
+    user_token_in: Pubkey,
+    user_token_out: Pubkey,
+    input_mint: Pubkey,
+    in_program: Pubkey,
+    out_program: Pubkey,
+    amount_in: u64,
+    min_amount_out: u64,
+) -> Result<Instruction, GenericError> {
+    if pool_data.len() < 203 {
+        return Err(format!(
+            "Pumpfun pool data too short: {} bytes, need at least 203", pool_data.len()
+        ).into());
+    }
+
+    let base_mint = Pubkey::new_from_array(pool_data[43..75].try_into().unwrap());
+    let quote_mint = Pubkey::new_from_array(pool_data[75..107].try_into().unwrap());
+    let pool_base_token_account = Pubkey::new_from_array(pool_data[139..171].try_into().unwrap());
+    let pool_quote_token_account = Pubkey::new_from_array(pool_data[171..203].try_into().unwrap());
+
+    // Buy = spending quote (SOL) to get base token. Sell = spending base to get quote (SOL).
+    let is_buy = input_mint == quote_mint;
+    if !is_buy && input_mint != base_mint {
+        return Err(format!(
+            "input_mint {} matches neither base {} nor quote {} in Pumpfun pool {}",
+            input_mint, base_mint, quote_mint, pool_address
+        ).into());
+    }
+
+    let (base_token_program, quote_token_program) = if is_buy {
+        (out_program, in_program)
+    } else {
+        (in_program, out_program)
+    };
+
+    build_pumpfun_swap(
+        &PumpfunSwapAccounts {
+            pool: pool_address,
+            base_mint,
+            quote_mint,
+            pool_base_vault: pool_base_token_account,
+            pool_quote_vault: pool_quote_token_account,
+            user_base_token: if is_buy { user_token_out } else { user_token_in },
+            user_quote_token: if is_buy { user_token_in } else { user_token_out },
+            user,
+            base_token_program,
+            quote_token_program,
+        },
+        amount_in,
+        min_amount_out,
+        is_buy,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dummy_pubkey(seed: u8) -> Pubkey {
+        Pubkey::new_from_array([seed; 32])
+    }
+
+    #[test]
+    fn clmm_exact_input_encoding() {
+        let accounts = ClmmSwapAccounts {
+            pool: dummy_pubkey(1), amm_config: dummy_pubkey(2),
+            input_vault: dummy_pubkey(3), output_vault: dummy_pubkey(4),
+            observation: dummy_pubkey(5), input_mint: dummy_pubkey(6),
+            output_mint: dummy_pubkey(7), user_input_token: dummy_pubkey(8),
+            user_output_token: dummy_pubkey(9), user: dummy_pubkey(10),
+            input_token_program: dummy_pubkey(11), output_token_program: dummy_pubkey(12),
+            tick_arrays: vec![dummy_pubkey(13)],
+        };
+        let ix = build_clmm_swap(&accounts, 1000, 900, 0, false).unwrap();
+        // disc(8) + amount(8) + threshold(8) + sqrt_price_limit(16) + is_base_input(1) = 41
+        assert_eq!(ix.data.len(), 41);
+        let amount = u64::from_le_bytes(ix.data[8..16].try_into().unwrap());
+        let threshold = u64::from_le_bytes(ix.data[16..24].try_into().unwrap());
+        let is_base_input = ix.data[40];
+        assert_eq!(amount, 1000, "ExactIn: amount should be input");
+        assert_eq!(threshold, 900, "ExactIn: threshold should be min output");
+        assert_eq!(is_base_input, 1, "ExactIn: is_base_input should be true");
+    }
+
+    #[test]
+    fn clmm_exact_output_encoding() {
+        let accounts = ClmmSwapAccounts {
+            pool: dummy_pubkey(1), amm_config: dummy_pubkey(2),
+            input_vault: dummy_pubkey(3), output_vault: dummy_pubkey(4),
+            observation: dummy_pubkey(5), input_mint: dummy_pubkey(6),
+            output_mint: dummy_pubkey(7), user_input_token: dummy_pubkey(8),
+            user_output_token: dummy_pubkey(9), user: dummy_pubkey(10),
+            input_token_program: dummy_pubkey(11), output_token_program: dummy_pubkey(12),
+            tick_arrays: vec![dummy_pubkey(13)],
+        };
+        // exact_output=true: amount_in=1000 (max input), min_amount_out=900 (exact output desired)
+        let ix = build_clmm_swap(&accounts, 1000, 900, 0, true).unwrap();
+        let amount = u64::from_le_bytes(ix.data[8..16].try_into().unwrap());
+        let threshold = u64::from_le_bytes(ix.data[16..24].try_into().unwrap());
+        let is_base_input = ix.data[40];
+        // Fields flip: amount = exact output (900), threshold = max input (1000)
+        assert_eq!(amount, 900, "ExactOut: amount should be exact output");
+        assert_eq!(threshold, 1000, "ExactOut: threshold should be max input");
+        assert_eq!(is_base_input, 0, "ExactOut: is_base_input should be false");
+    }
+
+    #[test]
+    fn ray_v4_exact_input_encoding() {
+        let accounts = RayV4SwapAccounts {
+            pool: dummy_pubkey(1), base_vault: dummy_pubkey(2),
+            quote_vault: dummy_pubkey(3), user_token_in: dummy_pubkey(4),
+            user_token_out: dummy_pubkey(5), user: dummy_pubkey(6),
+        };
+        let ix = build_ray_v4_swap(&accounts, 5000, 4500, false).unwrap();
+        assert_eq!(ix.data[0], 9, "ExactIn: disc should be 9 (swap_base_in)");
+        let amount_in = u64::from_le_bytes(ix.data[1..9].try_into().unwrap());
+        let min_out = u64::from_le_bytes(ix.data[9..17].try_into().unwrap());
+        assert_eq!(amount_in, 5000);
+        assert_eq!(min_out, 4500);
+    }
+
+    #[test]
+    fn ray_v4_exact_output_encoding() {
+        let accounts = RayV4SwapAccounts {
+            pool: dummy_pubkey(1), base_vault: dummy_pubkey(2),
+            quote_vault: dummy_pubkey(3), user_token_in: dummy_pubkey(4),
+            user_token_out: dummy_pubkey(5), user: dummy_pubkey(6),
+        };
+        // exact_output=true: amount_in=5000 (max input), min_amount_out=4500 (exact output)
+        let ix = build_ray_v4_swap(&accounts, 5000, 4500, true).unwrap();
+        assert_eq!(ix.data[0], 11, "ExactOut: disc should be 11 (swap_base_out)");
+        // Same struct layout, different semantics for swap_base_out:
+        // field1 = max_amount_in (5000), field2 = exact_amount_out (4500)
+        let field1 = u64::from_le_bytes(ix.data[1..9].try_into().unwrap());
+        let field2 = u64::from_le_bytes(ix.data[9..17].try_into().unwrap());
+        assert_eq!(field1, 5000, "ExactOut: field1 should be max input");
+        assert_eq!(field2, 4500, "ExactOut: field2 should be exact output");
+    }
 }

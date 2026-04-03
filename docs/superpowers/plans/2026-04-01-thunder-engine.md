@@ -226,7 +226,7 @@ After loading pools, collect all vault pubkeys (2 per pool = ~4M), batch-fetch v
 - [ ] **Step 2: Implement tick array fetching for top CLMM pools**
 
 Sort CLMM pools by vault balance (liquidity proxy). For the top 10,000:
-- Use `getProgramAccounts` with memcmp on pool address at offset 8 (same as surfpool_swap)
+- Use `getProgramAccounts` with memcmp on pool address at offset 8
 - Store tick array account data in AccountStore
 - Record tick array pubkeys in the pool's PoolInfo.tick_arrays
 
@@ -403,7 +403,7 @@ For backward compatibility, if no swappable_set is provided (None), all pools ar
 
 - [ ] **Step 1: Add variants that read from AccountStore**
 
-Add `build_dlmm_swap_from_store` and `build_clmm_swap_from_store` functions that take an `&AccountStore` and a pool address, read the pool data + auxiliary accounts from the store, and build the swap instruction. These complement the existing functions (which take explicit account structs) — the engine uses the `_from_store` variants, the surfpool_swap test continues using the explicit variants.
+Add `build_dlmm_swap_from_store` and `build_clmm_swap_from_store` functions that take an `&AccountStore` and a pool address, read the pool data + auxiliary accounts from the store, and build the swap instruction. These complement the existing functions (which take explicit account structs) — the engine uses the `_from_store` variants, integration tests continue using the explicit variants.
 
 ---
 

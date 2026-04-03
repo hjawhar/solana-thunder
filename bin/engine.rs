@@ -72,11 +72,18 @@ async fn main() {
     //    cached balances. Background task fetches fresh vault data and re-validates.
     let store = Arc::new(AccountStore::new());
     let pool_index = Arc::new(pool_index);
+    let rpc = Arc::new(RpcClient::new_with_timeout_and_commitment(
+        rpc_url.clone(),
+        Duration::from_secs(30),
+        CommitmentConfig::confirmed(),
+    ));
     let state = Arc::new(AppState {
         store: store.clone(),
         pool_index: pool_index.clone(),
         registry: Arc::new(RwLock::new(registry)),
+        rpc: rpc.clone(),
         sol_usd_price: RwLock::new(None),
+        recent_blockhash: RwLock::new(None),
         start_time: Instant::now(),
     });
 
@@ -163,7 +170,25 @@ async fn main() {
         }
     });
 
-    // 7. Start HTTP server (blocks main task).
+    // 7. Blockhash refresh every 2s.
+    let bh_state = state.clone();
+    let bh_rpc_url = rpc_url.clone();
+    tokio::spawn(async move {
+        let rpc = RpcClient::new_with_timeout_and_commitment(
+            bh_rpc_url,
+            Duration::from_secs(5),
+            CommitmentConfig::confirmed(),
+        );
+        loop {
+            if let Ok(bh) = rpc.get_latest_blockhash().await {
+                let slot = rpc.get_slot().await.unwrap_or(0);
+                *bh_state.recent_blockhash.write().await = Some((bh, slot));
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    });
+
+    // 8. Start HTTP server (blocks main task).
     let app = api::create_router(state);
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}"))
         .await
