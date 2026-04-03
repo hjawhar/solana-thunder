@@ -112,12 +112,6 @@ pub trait Market: Send + Sync {
 // Shared Utilities
 // ============================================================================
 
-/// Calculate slippage-adjusted min_amount_out.
-pub fn calculate_min_amount_out(expected_output: u64, slippage_bps: u64) -> u64 {
-    let slippage_multiplier = 10000 - slippage_bps;
-    (expected_output as u128 * slippage_multiplier as u128 / 10000) as u64
-}
-
 /// Calculate price impact in basis points (100 = 1%).
 pub fn calculate_price_impact_bps(pre_swap_price: f64, post_swap_price: f64) -> u64 {
     let impact = ((post_swap_price - pre_swap_price) / pre_swap_price).abs();

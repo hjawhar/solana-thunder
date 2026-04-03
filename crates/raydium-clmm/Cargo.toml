@@ -5,10 +5,6 @@ edition = "2024"
 
 [dependencies]
 thunder-core = { path = "../core" }
-solana-sdk = { workspace = true }
 solana-pubkey = { workspace = true }
-solana-system-interface = { workspace = true }
-spl-associated-token-account = { workspace = true }
-spl-token = { workspace = true }
 borsh = { workspace = true }
 serde = { workspace = true }

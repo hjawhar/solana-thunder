@@ -5,10 +5,7 @@ pub use models::{
     MeteoraDAMMPool, MeteoraDAMMV2Pool, VaultAuthority, CurveType, Config,
     V2PoolFees, BaseFee, PoolMetrics, DynamicFee, RewardInfo,
 };
-pub use utils::{
-    derive_vault_address, derive_token_vault_address, derive_strategy_address,
-    derive_collateral_vault_address, derive_token_lp_mint, VAULT_BASE_KEY,
-};
+pub use utils::derive_token_vault_address;
 
 use thunder_core::{
     GenericError, Market, PoolFinancials, PoolFees, PoolMetadata,

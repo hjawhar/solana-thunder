@@ -6,4 +6,3 @@ pub mod stats;
 pub mod loader;
 pub mod cli;
 pub mod cache;
-pub mod swap_builder;

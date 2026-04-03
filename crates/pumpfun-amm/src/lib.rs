@@ -1,4 +1,3 @@
-pub mod pda;
 
 use borsh::BorshDeserialize;
 use solana_pubkey::Pubkey;

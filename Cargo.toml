@@ -15,7 +15,6 @@ members = [
     "crates/aggregator",
     "crates/engine",
 ]
-exclude = ["crates/router-program"]
 
 [[bin]]
 name = "thunder-engine"
@@ -42,16 +41,11 @@ futures = "0.3.31"
 dotenvy = "0.15"
 
 # Integration tests
-thunder-aggregator = { path = "crates/aggregator" }
 solana-sdk = { workspace = true }
 solana-rpc-client = "3.0"
 solana-commitment-config = "3.0"
-solana-system-interface = { workspace = true }
-spl-associated-token-account = { workspace = true }
-spl-token = { workspace = true }
 bincode = "1.3"
 solana-rpc-client-api = "3.0"
-solana-account-decoder-client-types = "3.0"
 serde = { workspace = true }
 borsh = { workspace = true }
 

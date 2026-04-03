@@ -157,11 +157,3 @@ pub async fn geyser_client(snapshot: bool) -> GeyserGrpcClient<impl yellowstone_
 
     builder.connect().await.expect("connection failed")
 }
-
-/// Read u64 token balance from raw SPL token account data (bytes 64..72).
-pub fn read_token_balance(data: &[u8]) -> u64 {
-    if data.len() < 72 {
-        return 0;
-    }
-    u64::from_le_bytes(data[64..72].try_into().unwrap())
-}

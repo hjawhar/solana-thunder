@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
-use axum::routing::{get, post};
+use axum::routing::get;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use solana_pubkey::Pubkey;
@@ -27,9 +27,7 @@ pub struct AppState {
     pub store: Arc<AccountStore>,
     pub pool_index: Arc<PoolIndex>,
     pub registry: Arc<RwLock<PoolRegistry>>,
-    pub rpc: Arc<solana_rpc_client::nonblocking::rpc_client::RpcClient>,
     pub sol_usd_price: RwLock<Option<f64>>,
-    pub recent_blockhash: RwLock<Option<(solana_sdk::hash::Hash, u64)>>,
     pub start_time: Instant,
 }
 
@@ -40,7 +38,6 @@ pub struct AppState {
 pub fn create_router(state: Arc<AppState>) -> axum::Router {
     axum::Router::new()
         .route("/quote", get(handle_quote))
-        .route("/swap", post(handle_swap))
         .route("/price", get(handle_price))
         .route("/health", get(handle_health))
         .layer(CorsLayer::permissive())
@@ -149,107 +146,6 @@ async fn handle_quote(
         slippage_bps,
         routes,
         time_taken_ms: elapsed.as_millis(),
-    }))
-}
-
-// ---------------------------------------------------------------------------
-// POST /swap
-// ---------------------------------------------------------------------------
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SwapParams {
-    input_mint: String,
-    output_mint: String,
-    amount: u64,
-    user_public_key: String,
-    slippage_bps: Option<u64>,
-    max_hops: Option<usize>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SwapResponse {
-    /// Base64-encoded unsigned serialized VersionedTransaction.
-    transaction: String,
-    /// The route used.
-    route: RouteJson,
-    /// Blockhash used in the transaction.
-    blockhash: String,
-    time_taken_ms: u128,
-}
-
-async fn handle_swap(
-    State(state): State<Arc<AppState>>,
-    Json(params): Json<SwapParams>,
-) -> Result<Json<SwapResponse>, (StatusCode, String)> {
-    let input_mint = parse_mint(&params.input_mint).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    let output_mint = parse_mint(&params.output_mint).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
-    let user = Pubkey::from_str(&params.user_public_key)
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("invalid userPublicKey: {e}")))?;
-    let slippage_bps = params.slippage_bps.unwrap_or(50);
-    let max_hops = params.max_hops.unwrap_or(2).min(4);
-
-    let start = Instant::now();
-
-    // Get cached blockhash.
-    let (blockhash, _slot) = state.recent_blockhash.read().await
-        .ok_or((StatusCode::SERVICE_UNAVAILABLE, "blockhash not yet available".into()))?;
-
-    // Find best route.
-    let swappable = state.registry.read().await.swappable_set();
-    let router = Router::new(&state.pool_index, max_hops)
-        .with_swappable_set(swappable)
-        .with_live_data(state.store.as_ref());
-    let quote = router
-        .find_routes(input_mint, output_mint, params.amount, 1)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("routing error: {e}")))?;
-
-    let best = quote.best()
-        .ok_or((StatusCode::NOT_FOUND, "no route found".into()))?;
-
-    // Ensure all pool accounts in the route are in the store.
-    // Pools that haven't had gRPC updates yet need a one-shot RPC fetch.
-    for hop in &best.hops {
-        let pool_pk = Pubkey::from_str(&hop.pool_address)
-            .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad pool addr: {e}")))?;
-        if !state.store.contains(&pool_pk) {
-            if let Ok(acc) = state.rpc.get_account(&pool_pk).await {
-                state.store.upsert(pool_pk, acc.data, acc.owner, acc.lamports, 0);
-            }
-        }
-    }
-
-    // Build unsigned transaction.
-    let registry = state.registry.read().await;
-    let tx = crate::swap::build_swap_transaction(
-        best, &user, params.amount, slippage_bps,
-        &state.store, &registry, blockhash,
-    ).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("tx build error: {e}")))?;
-
-    // Serialize and base64 encode.
-    let tx_bytes = bincode::serialize(&tx)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("serialize error: {e}")))?;
-    let tx_base64 = solana_sdk::bs58::encode(&tx_bytes).into_string();
-
-    let route_json = RouteJson {
-        output_amount: best.output_amount.to_string(),
-        price_impact_bps: best.price_impact_bps,
-        hops: best.hops.iter().map(|hop| HopJson {
-            pool_address: hop.pool_address.clone(),
-            dex_name: hop.dex_name.clone(),
-            input_mint: hop.input_mint.to_string(),
-            output_mint: hop.output_mint.to_string(),
-            input_amount: hop.input_amount.to_string(),
-            output_amount: hop.output_amount.to_string(),
-        }).collect(),
-    };
-
-    Ok(Json(SwapResponse {
-        transaction: tx_base64,
-        route: route_json,
-        blockhash: blockhash.to_string(),
-        time_taken_ms: start.elapsed().as_millis(),
     }))
 }
 
